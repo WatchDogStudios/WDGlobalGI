@@ -1,0 +1,65 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "AssetAliasesSourceData",
+    "ClassData": {
+        "AssetPaths": [
+            {
+                "Name": "WDGlobalGIClearPassTemplate",
+                "Path": "Passes/WDGlobalGIClear.pass"
+            },
+            {
+                "Name": "WDGlobalGISceneInjectPassTemplate",
+                "Path": "Passes/WDGlobalGISceneInject.pass"
+            },
+            {
+                "Name": "WDGlobalGISdfUpdatePassTemplate",
+                "Path": "Passes/WDGlobalGISdfUpdate.pass"
+            },
+            {
+                "Name": "WDGlobalGIRelightPassTemplate",
+                "Path": "Passes/WDGlobalGIRelight.pass"
+            },
+            {
+                "Name": "WDGlobalGIPropagatePassTemplate",
+                "Path": "Passes/WDGlobalGIPropagate.pass"
+            },
+            {
+                "Name": "WDGlobalGIScreenProbeTracePassTemplate",
+                "Path": "Passes/WDGlobalGIScreenProbeTrace.pass"
+            },
+            {
+                "Name": "WDGlobalGIScreenProbeConvertPassTemplate",
+                "Path": "Passes/WDGlobalGIScreenProbeConvert.pass"
+            },
+            {
+                "Name": "WDGlobalGIScreenProbeBlurPassTemplate",
+                "Path": "Passes/WDGlobalGIScreenProbeBlur.pass"
+            },
+            {
+                "Name": "WDGlobalGIApplyPassTemplate",
+                "Path": "Passes/WDGlobalGIApply.pass"
+            },
+            {
+                "Name": "WDGlobalGIScreenProbeIntegratePassTemplate",
+                "Path": "Passes/WDGlobalGIScreenProbeIntegrate.pass"
+            },
+            {
+                "Name": "WDGlobalGIVolumetricPassTemplate",
+                "Path": "Passes/WDGlobalGIVolumetric.pass"
+            },
+            {
+                "Name": "WDGlobalGIVolumetricCompositePassTemplate",
+                "Path": "Passes/WDGlobalGIVolumetricComposite.pass"
+            },
+            {
+                "Name": "WDGlobalGIDebugPassTemplate",
+                "Path": "Passes/WDGlobalGIDebug.pass"
+            },
+            {
+                "Name": "WDGlobalGIParentPassTemplate",
+                "Path": "Passes/WDGlobalGIParent.pass"
+            }
+        ]
+    }
+}

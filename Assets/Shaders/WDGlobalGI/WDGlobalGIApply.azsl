@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI final composite (fullscreen). For each lit pixel, samples the irradiance clipmap
+ * (HL2 Ambient Cube) with trilinear 8-cell blending, evaluates indirect diffuse =
+ * (albedo/PI) * irradiance, and outputs it. The .shader uses an additive (One/One) blend so the
+ * result is summed into the deferred lighting target, exactly like the DiffuseProbeGrid composite.
+ * A fullscreen raster pass (rather than a compute UAV write) is required because the lighting
+ * target may be multisampled, and MSAA render targets cannot be bound as UAVs.
+ */
+
+#include <viewsrg_all.srgi>
+
+#include <Atom/Features/PostProcessing/FullscreenVertexUtil.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexInfo.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    // G-buffer inputs (auto-bound by slot order: albedo, normal, depth).
+    Texture2DMS<float4> m_albedo;
+    Texture2DMS<float4> m_normal;
+    Texture2DMS<float>  m_depth;
+
+    // Irradiance clipmap (bound from C++ by the feature processor).
+    Texture3D<float4>   m_irradianceClipmap;
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Trilinear sample of one ambient-cube face within cascade c, in cell-space coordinates.
+float3 SampleFaceTrilinear(float3 cellCoord, int c, int face)
+{
+    int3 res = WDGI_GridRes();
+    int3 originCell = WDGI_CascadeCenterCell(c) - res / 2;
+    float3 local = cellCoord - float3(originCell);
+
+    int3 baseCell = int3(floor(local));
+    float3 cellFrac = local - float3(baseCell);
+
+    float3 result = float3(0, 0, 0);
+    [unroll] for (int i = 0; i < 8; ++i)
+    {
+        int3 offset = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        int3 worldCell = baseCell + offset + originCell;
+        int3 physical = WDGI_PhysicalCell(worldCell);
+        int3 texel = WDGI_IrradianceTexel(physical, c, face);
+
+        float3 w3 = lerp(1.0f - cellFrac, cellFrac, float3(offset));
+        float w = w3.x * w3.y * w3.z;
+
+        result += PassSrg::m_irradianceClipmap.Load(int4(texel, 0)).rgb * w;
+    }
+    return result;
+}
+
+float3 SampleIrradiance(float3 worldPos, float3 normal)
+{
+    int c = WDGI_SelectCascade(worldPos);
+    if (c < 0)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float cell = WDGI_CascadeCellSize(c);
+    float3 cellCoord = worldPos / cell - 0.5f;
+
+    // HL2 Ambient Cube: only the 3 faces matching the normal's sign contribute, so sample just those
+    // (3 trilinear fetches instead of 6).
+    int faceX = (normal.x >= 0.0f) ? 0 : 1;
+    int faceY = (normal.y >= 0.0f) ? 2 : 3;
+    int faceZ = (normal.z >= 0.0f) ? 4 : 5;
+
+    float3 colorX = SampleFaceTrilinear(cellCoord, c, faceX);
+    float3 colorY = SampleFaceTrilinear(cellCoord, c, faceY);
+    float3 colorZ = SampleFaceTrilinear(cellCoord, c, faceZ);
+
+    float3 nSq = normal * normal;
+    return nSq.x * colorX + nSq.y * colorY + nSq.z * colorZ;
+}
+
+VSOutput MainVS(VSInput input)
+{
+    VSOutput OUT;
+    float4 posTex = GetVertexPositionAndTexCoords(input.m_vertexID);
+    OUT.m_texCoord = float2(posTex.z, posTex.w);
+    OUT.m_position = float4(posTex.x, posTex.y, 0.0f, 1.0f);
+    return OUT;
+}
+
+PSOutput MainPS(VSOutput IN, in uint sampleIndex : SV_SampleIndex)
+{
+    PSOutput OUT;
+    OUT.m_color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    uint2 screenCoords = uint2(IN.m_position.xy);
+    float depth = PassSrg::m_depth.Load(screenCoords, sampleIndex).r;
+
+    // Reverse-Z: background / sky has depth 0 -> nothing to add.
+    if (depth <= 0.0f)
+    {
+        return OUT;
+    }
+
+    float3 worldPos = WDGI_ReconstructWorldPos(IN.m_texCoord, depth);
+
+    float4 encodedNormal = PassSrg::m_normal.Load(screenCoords, sampleIndex);
+    float3 normal = DecodeNormalSignedOctahedron(encodedNormal.rgb);
+    float3 albedo = PassSrg::m_albedo.Load(screenCoords, sampleIndex).rgb;
+
+    // The ambient cube stores cosine-weighted average radiance, so L_out = albedo * irradiance
+    // (the BRDF /PI cancels the cosine-integral PI; do not divide again).
+    float3 irradiance = SampleIrradiance(worldPos, normal);
+    float3 diffuseGI = albedo * irradiance * PassSrg::m_giIntensity;
+
+    OUT.m_color = float4(diffuseGI, 1.0f);
+    return OUT;
+}

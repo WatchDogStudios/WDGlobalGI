@@ -1,0 +1,75 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI SDF update. Maintains a manhattan distance-to-surface field (in cells) over the voxel
+ * scene with one min-propagation iteration per frame: occupied voxels are 0; empty voxels take
+ * min(self, min(6 spatial neighbours) + 1), clamped. Converges temporally. The Propagate / Debug
+ * passes use this to sphere-trace (step ~ sdf * cell / sqrt(3)), which is conservative (manhattan/sqrt3
+ * is a lower bound on the true Euclidean distance, so a sphere step never overshoots a surface).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture3D<float4>  m_radianceClipmap; // rgb = radiance, a = occupancy
+    RWTexture3D<float> m_sdfClipmap;       // distance-to-surface in cells
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+
+static const float WDGI_MAX_SDF_CELLS = 16.0f;
+
+float SdfAt(int3 worldCell, int cascade)
+{
+    int3 physical = WDGI_PhysicalCell(worldCell);
+    int3 texel = WDGI_RadianceTexel(physical, cascade);
+    // Clamp to sanitise undefined initial texture content (the attachment image may start uninitialised).
+    return clamp(PassSrg::m_sdfClipmap[texel], 0.0f, WDGI_MAX_SDF_CELLS);
+}
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    int3 res = WDGI_GridRes();
+    uint totalZ = (uint)res.z * PassSrg::m_cascadeCount;
+    if (dispatch_id.x >= (uint)res.x || dispatch_id.y >= (uint)res.y || dispatch_id.z >= totalZ)
+    {
+        return;
+    }
+
+    int cascade = (int)(dispatch_id.z / (uint)res.z);
+    int localZ = (int)(dispatch_id.z % (uint)res.z);
+    int3 physical = int3(int2(dispatch_id.xy), localZ);
+    int3 selfTexel = int3(dispatch_id.xyz); // == WDGI_RadianceTexel(physical, cascade)
+
+    // Occupied voxels are surfaces: distance 0.
+    float occupancy = PassSrg::m_radianceClipmap.Load(int4(selfTexel, 0)).a;
+    if (occupancy > 0.5f)
+    {
+        PassSrg::m_sdfClipmap[selfTexel] = 0.0f;
+        return;
+    }
+
+    // Empty voxel: distance = 1 + the minimum of the 6 spatial neighbours. This is recomputed from
+    // neighbours each frame (NOT min'd against the previous self value) so it grows correctly outward
+    // from occupied voxels even though the texture initialises to 0; it relaxes to the true manhattan
+    // distance over a handful of frames and is stable at the fixed point (distance = min(nb)+1).
+    int3 W = WDGI_LiveWorldCell(physical, cascade);
+    float best = WDGI_MAX_SDF_CELLS;
+
+    best = min(best, SdfAt(W + int3( 1, 0, 0), cascade) + 1.0f);
+    best = min(best, SdfAt(W + int3(-1, 0, 0), cascade) + 1.0f);
+    best = min(best, SdfAt(W + int3( 0, 1, 0), cascade) + 1.0f);
+    best = min(best, SdfAt(W + int3( 0,-1, 0), cascade) + 1.0f);
+    best = min(best, SdfAt(W + int3( 0, 0, 1), cascade) + 1.0f);
+    best = min(best, SdfAt(W + int3( 0, 0,-1), cascade) + 1.0f);
+
+    PassSrg::m_sdfClipmap[selfTexel] = min(best, WDGI_MAX_SDF_CELLS);
+}

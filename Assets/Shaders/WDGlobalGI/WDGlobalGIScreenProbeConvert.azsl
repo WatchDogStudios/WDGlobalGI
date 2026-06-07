@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI screen-probe convert. Projects each probe's 8x8 octahedral radiance onto an order-2
+ * irradiance SH (9 RGB coeffs, cosine-lobe convolved) and writes it to the SH atlas (9 texels/probe).
+ * This lets the integrate do cheap, smooth bilinear interpolation between probes instead of a 64-tap
+ * per-pixel convolution, and removes the per-tile blockiness.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2D<float4>   m_screenProbeAtlas; // octahedral radiance (read)
+    RWTexture2D<float4> m_screenProbeSH;    // 9 irradiance-SH coeff texels per probe (write)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+}
+
+#include <WDGlobalGICommon.azsli>
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint2 tile = dispatch_id.xy;
+    if (tile.x >= PassSrg::m_screenProbeInfo.z || tile.y >= PassSrg::m_screenProbeInfo.w)
+    {
+        return;
+    }
+
+    uint2 octaBase = tile * uint(WDGI_SP_OCTA);
+
+    float3 sh[9];
+    [unroll] for (int k = 0; k < 9; ++k)
+    {
+        sh[k] = float3(0.0f, 0.0f, 0.0f);
+    }
+
+    [loop] for (uint oy = 0; oy < WDGI_SP_OCTA; ++oy)
+    {
+        [loop] for (uint ox = 0; ox < WDGI_SP_OCTA; ++ox)
+        {
+            float3 dir = WDGI_OctaDecode((float2(ox, oy) + 0.5f) / float(WDGI_SP_OCTA));
+            float3 L = PassSrg::m_screenProbeAtlas.Load(int3(octaBase + uint2(ox, oy), 0)).rgb;
+            float Y[9];
+            WDGI_SHBasis(dir, Y);
+            [unroll] for (int k = 0; k < 9; ++k)
+            {
+                sh[k] += L * Y[k];
+            }
+        }
+    }
+
+    // Monte-Carlo solid-angle weight (uniform sphere) and cosine-lobe convolution -> irradiance SH.
+    const float weight = (4.0f * 3.14159265f) / float(WDGI_SP_OCTA * WDGI_SP_OCTA);
+    uint2 shBase = uint2(tile.x * uint(WDGI_SP_COEFFS), tile.y);
+    [unroll] for (int k = 0; k < 9; ++k)
+    {
+        float3 coeff = sh[k] * (weight * WDGI_SHCosineBand(k));
+        PassSrg::m_screenProbeSH[shBase + uint2(k, 0)] = float4(coeff, 1.0f);
+    }
+}

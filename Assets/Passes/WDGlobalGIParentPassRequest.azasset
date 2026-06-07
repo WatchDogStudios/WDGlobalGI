@@ -1,0 +1,28 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassRequest",
+    "ClassData": {
+        "Name": "WDGlobalGIPass",
+        "TemplateName": "WDGlobalGIParentPassTemplate",
+        "Enabled": true,
+        "Connections": [
+            {
+                "LocalSlot": "AlbedoInput",
+                "AttachmentRef": { "Pass": "Forward", "Attachment": "AlbedoOutput" }
+            },
+            {
+                "LocalSlot": "NormalInput",
+                "AttachmentRef": { "Pass": "Forward", "Attachment": "NormalOutput" }
+            },
+            {
+                "LocalSlot": "DepthStencilInputOutput",
+                "AttachmentRef": { "Pass": "Forward", "Attachment": "DepthStencilInputOutput" }
+            },
+            {
+                "LocalSlot": "DiffuseInputOutput",
+                "AttachmentRef": { "Pass": "Forward", "Attachment": "DiffuseOutput" }
+            }
+        ]
+    }
+}

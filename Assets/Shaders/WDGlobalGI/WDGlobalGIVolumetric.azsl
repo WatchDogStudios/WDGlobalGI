@@ -1,0 +1,89 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI volumetric / media GI (audit #7). Fills a view-aligned froxel volume with the GI that is
+ * in-scattered toward the camera by participating media (fog). One thread per froxel column marches the
+ * Z slices front-to-back, sampling the world irradiance clipmap at each slice, attenuating by the fog
+ * transmittance, and storing the ACCUMULATED in-scatter so the composite can read the total between the
+ * camera and any depth with a single tap. Indirect light then visibly scatters through fog / god-rays.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+#define WDGI_FROXEL_X 160
+#define WDGI_FROXEL_Y 90
+#define WDGI_FROXEL_Z 64
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture3D<float4>   m_irradianceClipmap;   // world GI (ambient cube) sampled per froxel
+    RWTexture3D<float4> m_volumetricFroxel;     // rgb = accumulated in-scatter, a = transmittance
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    float m_volumetricDensity;      // 0..1 fog thickness
+    float m_volumetricIntensity;    // multiplier on the in-scattered GI
+    float m_volumetricMaxDistance;  // world distance covered by the froxel volume
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Ambient-cube irradiance (nearest cell) at a world position, evaluated toward a direction.
+float3 VolSampleIrradiance(float3 worldPos, float3 dir)
+{
+    int c = WDGI_SelectCascade(worldPos);
+    if (c < 0)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    int3 phys = WDGI_PhysicalCell(WDGI_WorldCell(worldPos, c));
+    float3 faces[WDGLOBALGI_FACE_COUNT];
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        faces[f] = PassSrg::m_irradianceClipmap.Load(int4(WDGI_IrradianceTexel(phys, c, f), 0)).rgb;
+    }
+    return WDGI_EvalAmbientCube(faces, dir);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    if (dispatch_id.x >= WDGI_FROXEL_X || dispatch_id.y >= WDGI_FROXEL_Y)
+    {
+        return;
+    }
+
+    float2 uv = (float2(dispatch_id.xy) + 0.5f) / float2(WDGI_FROXEL_X, WDGI_FROXEL_Y);
+
+    // View ray for this froxel column (reverse-Z: depth 1 = near, ~0 = far).
+    float3 nearPos = WDGI_ReconstructWorldPos(uv, 1.0f);
+    float3 farPos  = WDGI_ReconstructWorldPos(uv, 0.0001f);
+    float3 rayDir  = normalize(farPos - nearPos);
+
+    float maxDist = max(PassSrg::m_volumetricMaxDistance, 1.0f);
+    float sliceThickness = maxDist / float(WDGI_FROXEL_Z);
+    float extinction = PassSrg::m_volumetricDensity * 0.1f; // map the 0..1 slider to a per-metre coefficient
+
+    float3 inScatterAccum = float3(0.0f, 0.0f, 0.0f);
+    float transmittance = 1.0f;
+
+    [loop] for (uint z = 0; z < WDGI_FROXEL_Z; ++z)
+    {
+        float t = (float(z) + 0.5f) / float(WDGI_FROXEL_Z);
+        float3 froxelPos = nearPos + rayDir * (t * maxDist);
+
+        // Light scattered toward the camera at this froxel (isotropic phase approximation: the ambient
+        // cube evaluated back along the view ray).
+        float3 gi = VolSampleIrradiance(froxelPos, -rayDir);
+        float3 sliceInScatter = gi * (extinction * sliceThickness * PassSrg::m_volumetricIntensity);
+
+        inScatterAccum += transmittance * sliceInScatter;
+        transmittance *= exp(-extinction * sliceThickness);
+
+        PassSrg::m_volumetricFroxel[int3(int2(dispatch_id.xy), int(z))] = float4(inScatterAccum, transmittance);
+    }
+}

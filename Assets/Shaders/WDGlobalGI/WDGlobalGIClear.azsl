@@ -1,0 +1,84 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI toroidal clear (anti-ghosting). The voxel clipmaps are addressed toroidally
+ * (physical = worldCell & (gridResolution - 1)), so when a cascade re-centres as the camera moves the
+ * physical texels that wrap to a NEW world cell still hold the PREVIOUS cell's radiance / albedo / SDF
+ * -> visible ghosting. This pass runs first each frame and zeroes any texel whose live world cell
+ * changed since last frame (camera scroll), or every texel when m_clearAll is set (after an
+ * invalidation / cell-size change). Newly-exposed voxels therefore start empty and are refilled by the
+ * inject / propagate passes instead of smearing stale data.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    RWTexture3D<float4> m_radianceClipmap;
+    RWTexture3D<float4> m_irradianceClipmap;
+    RWTexture3D<float>  m_sdfClipmap;
+    RWTexture3D<float4> m_voxelNormalClipmap;
+    RWTexture3D<float4> m_albedoClipmap;
+    RWTexture3D<float4> m_anisoRadianceClipmap; // 6-direction radiance buckets (#4)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Empty-SDF value (cells). Matches WDGI_MAX_SDF_CELLS in WDGlobalGISdfUpdate.azsl: a just-cleared voxel
+// is "far from any surface" until the SDF relaxation pulls the field back in from real geometry.
+static const float WDGI_SDF_FAR = 16.0f;
+
+// The live world cell a physical texel maps to under an EXPLICIT centre cell (the toroidal inverse used
+// with both the current and previous-frame centres so we can detect texels that scrolled into view).
+int3 WDGI_LiveWorldCellAt(int3 physical, int3 centerCell)
+{
+    int3 res = WDGI_GridRes();
+    int3 mask = res - 1;
+    int3 originCell = centerCell - res / 2;
+    return originCell + ((physical - originCell) & mask);
+}
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    int3 res = WDGI_GridRes();
+    uint totalZ = (uint)res.z * PassSrg::m_cascadeCount;
+    if (dispatch_id.x >= (uint)res.x || dispatch_id.y >= (uint)res.y || dispatch_id.z >= totalZ)
+    {
+        return;
+    }
+
+    int cascade = (int)(dispatch_id.z / (uint)res.z);
+    int localZ = (int)(dispatch_id.z % (uint)res.z);
+    int3 physical = int3(int2(dispatch_id.xy), localZ);
+    int3 selfTexel = int3(dispatch_id.xyz); // == WDGI_RadianceTexel(physical, cascade)
+
+    int3 centerNew = int3(round(PassSrg::m_cascadeCenterAndCell[cascade].xyz));
+    int3 centerOld = int3(round(PassSrg::m_prevCascadeCenterAndCell[cascade].xyz));
+    int3 worldNew = WDGI_LiveWorldCellAt(physical, centerNew);
+    int3 worldOld = WDGI_LiveWorldCellAt(physical, centerOld);
+
+    // Keep texels that still represent the same world cell (unless a full clear was requested).
+    if (PassSrg::m_clearAll == 0 && !any(worldNew != worldOld))
+    {
+        return;
+    }
+
+    PassSrg::m_radianceClipmap[selfTexel]    = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    PassSrg::m_voxelNormalClipmap[selfTexel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    PassSrg::m_albedoClipmap[selfTexel]      = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    PassSrg::m_sdfClipmap[selfTexel]         = WDGI_SDF_FAR;
+
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        int3 faceTexel = WDGI_IrradianceTexel(physical, cascade, f);
+        PassSrg::m_irradianceClipmap[faceTexel]    = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        PassSrg::m_anisoRadianceClipmap[faceTexel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}

@@ -1,0 +1,119 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI screen-probe SH denoise. Each screen probe's order-2 irradiance SH is built from only 64
+ * one-sample octahedral rays, so it's noisy. This pass spatially blurs the SH across a 3x3 neighbourhood
+ * of probes, weighting neighbours by world-position (depth) similarity so it doesn't bleed across
+ * geometry edges. The integrate then reads this smoothed SH. Strength is m_screenProbeBlur (0 = off).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float>  m_depth;                 // G-buffer depth (probe placement / depth weighting)
+    Texture2D<float4>   m_screenProbeSH;         // raw irradiance SH (9 coeffs/probe)
+    RWTexture2D<float4> m_screenProbeSHBlurred;  // depth-aware spatially-blurred output
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+    float m_screenProbeBlur;   // 0 = passthrough, 1 = full blur
+}
+
+#include <WDGlobalGICommon.azsli>
+
+bool TileWorldPos(int2 tile, uint2 screenRes, out float3 worldPos)
+{
+    uint2 px = min(uint2(tile) * uint(WDGI_SP_TILE) + (WDGI_SP_TILE / 2), screenRes - uint2(1, 1));
+    float d = PassSrg::m_depth.Load(int2(px), 0).r;
+    if (d <= 0.0f)
+    {
+        worldPos = float3(0, 0, 0);
+        return false;
+    }
+    float2 uv = (float2(px) + 0.5f) / float2(screenRes);
+    worldPos = WDGI_ReconstructWorldPos(uv, d);
+    return true;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint2 tile = dispatch_id.xy;
+    uint tilesX = PassSrg::m_screenProbeInfo.z;
+    uint tilesY = PassSrg::m_screenProbeInfo.w;
+    if (tile.x >= tilesX || tile.y >= tilesY)
+    {
+        return;
+    }
+    uint2 screenRes = PassSrg::m_screenProbeInfo.xy;
+    uint2 shBase = uint2(tile.x * uint(WDGI_SP_COEFFS), tile.y);
+
+    float3 centerWP;
+    bool centerValid = TileWorldPos(int2(tile), screenRes, centerWP);
+
+    // Passthrough when blur is off or this probe has no surface.
+    if (!centerValid || PassSrg::m_screenProbeBlur <= 0.001f)
+    {
+        [unroll] for (int k = 0; k < WDGI_SP_COEFFS; ++k)
+        {
+            PassSrg::m_screenProbeSHBlurred[shBase + uint2(k, 0)] = PassSrg::m_screenProbeSH.Load(int3(shBase + uint2(k, 0), 0));
+        }
+        return;
+    }
+
+    float radius = max(PassSrg::m_cascadeCenterAndCell[0].w * 4.0f, 0.25f); // world-space depth sigma
+
+    float3 acc[WDGI_SP_COEFFS];
+    [unroll] for (int k = 0; k < WDGI_SP_COEFFS; ++k)
+    {
+        acc[k] = float3(0, 0, 0);
+    }
+    float weightSum = 0.0f;
+
+    [loop] for (int dy = -1; dy <= 1; ++dy)
+    {
+        [loop] for (int dx = -1; dx <= 1; ++dx)
+        {
+            int2 nt = int2(tile) + int2(dx, dy);
+            if (nt.x < 0 || nt.y < 0 || nt.x >= (int)tilesX || nt.y >= (int)tilesY)
+            {
+                continue;
+            }
+            float3 nwp;
+            if (!TileWorldPos(nt, screenRes, nwp))
+            {
+                continue;
+            }
+            float dist = distance(nwp, centerWP);
+            float wDepth = exp(-(dist * dist) / (radius * radius));      // edge-stopping (depth) weight
+            float wSpatial = exp(-float(dx * dx + dy * dy) * 0.5f);      // gaussian falloff
+            float w = wDepth * wSpatial;
+            if (dx == 0 && dy == 0)
+            {
+                w = max(w, 1e-3f); // make sure the centre always contributes
+            }
+
+            uint2 nBase = uint2(uint(nt.x) * uint(WDGI_SP_COEFFS), uint(nt.y));
+            [unroll] for (int k = 0; k < WDGI_SP_COEFFS; ++k)
+            {
+                acc[k] += PassSrg::m_screenProbeSH.Load(int3(nBase + uint2(k, 0), 0)).rgb * w;
+            }
+            weightSum += w;
+        }
+    }
+
+    float inv = (weightSum > 1e-5f) ? (1.0f / weightSum) : 0.0f;
+    float strength = saturate(PassSrg::m_screenProbeBlur);
+    [unroll] for (int k = 0; k < WDGI_SP_COEFFS; ++k)
+    {
+        float3 orig = PassSrg::m_screenProbeSH.Load(int3(shBase + uint2(k, 0), 0)).rgb;
+        float3 blurred = acc[k] * inv;
+        PassSrg::m_screenProbeSHBlurred[shBase + uint2(k, 0)] = float4(lerp(orig, blurred, strength), 1.0f);
+    }
+}

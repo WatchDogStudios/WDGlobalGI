@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI scene feedback pass. Relights visible G-buffer pixels with direct sun light plus the
+ * current irradiance clipmap (indirect), and injects the result into the voxel-radiance clipmap with
+ * a moving average. This closes the Dagor GI feedback loop (multiple bounces + voxelization fix-up).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    // G-buffer inputs (from the Forward pass). The pipeline is MSAA, so these are multisampled; we
+    // read sample 0, which is sufficient for the low-frequency voxel injection.
+    Texture2DMS<float>  m_depth;
+    Texture2DMS<float4> m_normal;   // signed-octahedron encoded in rgb
+    Texture2DMS<float4> m_albedo;   // rgb = albedo
+
+    // Real direct diffuse lighting from the Forward pass (so the injected voxels match the scene).
+    Texture2DMS<float4> m_lighting;
+
+    // Clipmaps.
+    Texture3D<float4>   m_irradianceClipmap;  // read (indirect bounce)
+    RWTexture3D<float4> m_radianceClipmap;     // read-modify-write
+    RWTexture3D<float4> m_voxelNormalClipmap;  // rgb = normal*0.5+0.5, a = valid (leak reduction)
+    RWTexture3D<float4> m_albedoClipmap;       // rgb = albedo (for the relight pass)
+    RWTexture3D<float4> m_anisoRadianceClipmap; // 6-direction radiance buckets (#4)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Sample the nearest probe's ambient cube for the indirect irradiance at a surface point.
+float3 SampleIrradianceNearest(float3 worldPos, float3 normal)
+{
+    int c = WDGI_SelectCascade(worldPos);
+    if (c < 0)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    int3 worldCell = WDGI_WorldCell(worldPos, c);
+    int3 physical = WDGI_PhysicalCell(worldCell);
+
+    float3 faceColors[WDGLOBALGI_FACE_COUNT];
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        int3 texel = WDGI_IrradianceTexel(physical, c, f);
+        faceColors[f] = PassSrg::m_irradianceClipmap.Load(int4(texel, 0)).rgb;
+    }
+    return WDGI_EvalAmbientCube(faceColors, normal);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint2 dimensions;
+    uint sampleCount;
+    PassSrg::m_depth.GetDimensions(dimensions.x, dimensions.y, sampleCount);
+    if (dispatch_id.x >= dimensions.x || dispatch_id.y >= dimensions.y)
+    {
+        return;
+    }
+
+    int2 pixel = int2(dispatch_id.xy);
+    float depth = PassSrg::m_depth.Load(pixel, 0).r;
+
+    // Skip sky / background.
+    if (depth <= 0.0f)
+    {
+        return;
+    }
+
+    float2 uv = (float2(pixel) + 0.5f) / float2(dimensions);
+    float3 worldPos = WDGI_ReconstructWorldPos(uv, depth);
+
+    int cascade = WDGI_SelectCascade(worldPos);
+    if (cascade < 0)
+    {
+        return; // surface outside the GI volume
+    }
+
+    float4 encodedNormal = PassSrg::m_normal.Load(pixel, 0);
+    float3 normal = DecodeNormalSignedOctahedron(encodedNormal.rgb);
+    float3 albedo = PassSrg::m_albedo.Load(pixel, 0).rgb;
+
+    // Real direct diffuse lighting (the Forward pass output captures the actual sun/sky/lights, so the
+    // injected radiance matches what the player sees - this is the Dagor "feedback from g-buffer").
+    float3 directDiffuse = PassSrg::m_lighting.Load(pixel, 0).rgb;
+
+    // Indirect light from the current irradiance clipmap (previous frames -> multiple bounces).
+    // L_out = albedo * avg-radiance (the ambient cube already stores cosine-weighted average radiance).
+    float3 indirectIrradiance = SampleIrradianceNearest(worldPos, normal);
+    float3 indirectDiffuse = albedo * indirectIrradiance;
+
+    // Outgoing diffuse radiance of this surfel.
+    float3 litColor = directDiffuse + indirectDiffuse;
+
+    // Moving-average injection into the voxel grid.
+    int3 physical = WDGI_PhysicalCell(WDGI_WorldCell(worldPos, cascade));
+    int3 texel = WDGI_RadianceTexel(physical, cascade);
+
+    float4 previous = PassSrg::m_radianceClipmap[texel];
+    float3 blended = (previous.a > 0.0f) ? lerp(litColor, previous.rgb, PassSrg::m_sceneBlend) : litColor;
+
+    PassSrg::m_radianceClipmap[texel] = float4(blended, 1.0f);
+
+    // Store the surface normal (encoded, moving-averaged) for back-face hit attenuation during tracing.
+    // (Renamed from 'encodedNormal' to avoid colliding with the g-buffer normal sample above - azslc
+    // treats a same-scope redeclaration as an ODR violation.)
+    float4 prevNormal = PassSrg::m_voxelNormalClipmap[texel];
+    float3 encodedVoxelNormal = normal * 0.5f + 0.5f;
+    float3 blendedNormal = (prevNormal.a > 0.0f) ? lerp(encodedVoxelNormal, prevNormal.rgb, PassSrg::m_sceneBlend) : encodedVoxelNormal;
+    PassSrg::m_voxelNormalClipmap[texel] = float4(blendedNormal, 1.0f);
+
+    // Store albedo so the (optional) relight pass can recompute lighting for the whole voxel scene.
+    PassSrg::m_albedoClipmap[texel] = float4(albedo, 1.0f);
+
+    // Anisotropic radiance (#4): spread the lit radiance into the 6 face buckets weighted by how much
+    // the surface normal faces each cube direction. The tracer later samples the bucket facing the ray,
+    // so a thin wall lit on one side stores ~nothing for the opposite side (no light leaking through).
+    if (PassSrg::m_anisotropic != 0)
+    {
+        [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+        {
+            float w = saturate(dot(normal, WDGI_AmbientCubeDir(f)));
+            int3 anisoTexel = WDGI_IrradianceTexel(physical, cascade, f);
+            float4 prevAniso = PassSrg::m_anisoRadianceClipmap[anisoTexel];
+            float3 newAniso = litColor * w;
+            float3 blendedAniso = (prevAniso.a > 0.0f) ? lerp(newAniso, prevAniso.rgb, PassSrg::m_sceneBlend) : newAniso;
+            PassSrg::m_anisoRadianceClipmap[anisoTexel] = float4(blendedAniso, 1.0f);
+        }
+    }
+}

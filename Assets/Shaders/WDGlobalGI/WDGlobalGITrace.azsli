@@ -1,0 +1,173 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Shared voxel sphere-tracer. Include this AFTER the PassSrg declaration and WDGlobalGICommon.azsli, in
+ * shaders that declare:
+ *   PassSrg::m_radianceClipmap      (Texture3D<float4>)
+ *   PassSrg::m_sdfClipmap           (Texture3D<float>)
+ *   PassSrg::m_voxelNormalClipmap   (Texture3D<float4>)
+ *   PassSrg::m_anisoRadianceClipmap (Texture3D<float4>)  - 6-direction radiance (audit #4)
+ *
+ * Radiance cache (audit #8): define WDGI_TRACE_USE_CACHE before including this header to enable it. The
+ * including shader must then ALSO declare PassSrg::m_irradianceClipmap as a *read* Texture3D<float4>.
+ * (The Propagate pass owns the irradiance clipmap as a RWTexture3D and does not enable the cache, so the
+ * tracer never needs to read a writable irradiance resource - avoiding both a read-during-write feedback
+ * and any reliance on Texture3D operator[].)
+ */
+
+#pragma once
+
+#ifdef WDGI_TRACE_USE_CACHE
+// Pick the irradiance read accessor: the Propagate pass owns the clipmap as a RWTexture3D (operator[]),
+// the screen-probe trace binds it read-only as a Texture3D (.Load). Define WDGI_IRRADIANCE_RW in the
+// former before including this header.
+#ifdef WDGI_IRRADIANCE_RW
+#define WDGI_IRR_LOAD(t) PassSrg::m_irradianceClipmap[t]
+#else
+#define WDGI_IRR_LOAD(t) PassSrg::m_irradianceClipmap.Load(int4(t, 0))
+#endif
+
+// The world irradiance clipmap doubles as a far-field cache: a ray that escapes the cascades (or runs
+// out of steps) reuses the cached irradiance from that direction instead of only the flat sky - a cheap
+// extra bounce. Returns rgb + a convergence flag in .a (0 = not yet written, so the caller falls back to
+// the analytic sky and the system still bootstraps from the sky each frame).
+float4 WDGI_SampleRadianceCache(float3 worldPos, float3 dir, int c)
+{
+    int3 phys = WDGI_PhysicalCell(WDGI_WorldCell(worldPos, c));
+    float3 faceColors[WDGLOBALGI_FACE_COUNT];
+    float convergence = 0.0f;
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        float4 s = WDGI_IRR_LOAD(WDGI_IrradianceTexel(phys, c, f));
+        faceColors[f] = s.rgb;
+        convergence += s.a;
+    }
+    return float4(WDGI_EvalAmbientCube(faceColors, dir), convergence);
+}
+#endif // WDGI_TRACE_USE_CACHE
+
+// Fetch the lit radiance a voxel emits toward 'dir' at a world position in a specific cascade. Uses the
+// anisotropic buckets when enabled, otherwise the isotropic radiance with the single-normal leak term.
+float3 WDGI_FetchRadianceAt(float3 worldPos, int c, float3 dir, out bool occupied)
+{
+    float cellSize = WDGI_CascadeCellSize(c);
+    int3 phys = WDGI_PhysicalCell(int3(floor(worldPos / cellSize)));
+    int3 texel = WDGI_RadianceTexel(phys, c);
+    float4 rad = PassSrg::m_radianceClipmap.Load(int4(texel, 0));
+    occupied = rad.a > 0.5f;
+    if (!occupied)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    if (PassSrg::m_anisotropic != 0)
+    {
+        float3 buckets[WDGLOBALGI_FACE_COUNT];
+        [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+        {
+            buckets[f] = PassSrg::m_anisoRadianceClipmap.Load(int4(WDGI_IrradianceTexel(phys, c, f), 0)).rgb;
+        }
+        return WDGI_EvalAmbientCube(buckets, -dir);
+    }
+    float3 hitRadiance = rad.rgb;
+    float4 voxelNormal = PassSrg::m_voxelNormalClipmap.Load(int4(texel, 0));
+    if (voxelNormal.a > 0.5f)
+    {
+        float facing = saturate(dot(-dir, voxelNormal.rgb * 2.0f - 1.0f));
+        hitRadiance *= lerp(1.0f, facing, PassSrg::m_leakReduction);
+    }
+    return hitRadiance;
+}
+
+// Cascade-blend weight: 0 in the interior of cascade c, ramping to 1 at the outer edge of its window.
+float WDGI_CascadeBlendWeight(float3 worldPos, int c)
+{
+    int3 cell = WDGI_WorldCell(worldPos, c);
+    int3 d = abs(cell - WDGI_CascadeCenterCell(c));
+    float3 halfRes = max(float3(WDGI_GridRes() / 2), float3(1.0f, 1.0f, 1.0f));
+    float3 norm = float3(d) / halfRes;
+    float maxNorm = max(norm.x, max(norm.y, norm.z));
+    return smoothstep(0.75f, 1.0f, maxNorm);
+}
+
+// Sphere-trace through the voxel-radiance clipmap. Hit-testing is on the occupancy channel; the step
+// length is driven by the SDF (manhattan distance, in cells), so confirmed-empty space is crossed in
+// big jumps. Stepping by sdf*cell/sqrt(3) is a conservative lower bound on the Euclidean distance, so a
+// step never overshoots a surface; the one-cell minimum preserves near-surface accuracy. Returns the
+// first opaque radiance hit, the cached far-field, or the sky.
+float3 WDGI_TraceVoxelRay(float3 origin, float3 dir, out float hitDistance)
+{
+    float3 pos = origin;
+    float3 lastValidPos = origin;
+    int lastValidCascade = -1;
+    hitDistance = 1e4f; // default: nothing hit within the volume (treated as "far" by the depth/Chebyshev term)
+
+    [loop] for (uint s = 0; s < PassSrg::m_maxRaySteps; ++s)
+    {
+        int c = WDGI_SelectCascade(pos);
+        if (c < 0)
+        {
+#ifdef WDGI_TRACE_USE_CACHE
+            // Exited every cascade. Reuse the cached far-field irradiance if it has converged (#8).
+            if (PassSrg::m_useRadianceCache != 0 && lastValidCascade >= 0)
+            {
+                float4 cached = WDGI_SampleRadianceCache(lastValidPos, dir, lastValidCascade);
+                if (cached.a > 0.0f)
+                {
+                    return cached.rgb;
+                }
+            }
+#endif
+            return WDGI_Sky(dir);
+        }
+        lastValidPos = pos;
+        lastValidCascade = c;
+
+        float cell = WDGI_CascadeCellSize(c);
+        int3 voxel = int3(floor(pos / cell));
+        int3 phys = WDGI_PhysicalCell(voxel);
+        int3 texel = WDGI_RadianceTexel(phys, c);
+
+        float4 voxelSample = PassSrg::m_radianceClipmap.Load(int4(texel, 0));
+        if (voxelSample.a > 0.5f)
+        {
+            hitDistance = length(pos - origin); // distance to the first surface, for the depth/Chebyshev term
+
+            bool occ;
+            float3 hitRadiance = WDGI_FetchRadianceAt(pos, c, dir, occ);
+
+            // Cascade blend: near cascade c's outer boundary, fade toward the coarser (nested) cascade c+1
+            // so the GI doesn't show a hard "cascade line" seam where the selected cascade changes.
+            float tBlend = PassSrg::m_cascadeBlend * WDGI_CascadeBlendWeight(pos, c);
+            if (tBlend > 0.001f && (c + 1) < (int)PassSrg::m_cascadeCount)
+            {
+                bool occCoarse;
+                float3 coarse = WDGI_FetchRadianceAt(pos, c + 1, dir, occCoarse);
+                if (occCoarse)
+                {
+                    hitRadiance = lerp(hitRadiance, coarse, tBlend);
+                }
+            }
+            return hitRadiance; // opaque hit
+        }
+
+        float sdfCells = PassSrg::m_sdfClipmap.Load(int4(texel, 0));
+        float stepWorld = max(sdfCells * cell * 0.57735f, cell);
+        pos += dir * stepWorld;
+    }
+
+#ifdef WDGI_TRACE_USE_CACHE
+    // Ran out of steps inside the volume: reuse the cache here too (better than a flat sky pop).
+    if (PassSrg::m_useRadianceCache != 0 && lastValidCascade >= 0)
+    {
+        float4 cached = WDGI_SampleRadianceCache(lastValidPos, dir, lastValidCascade);
+        if (cached.a > 0.0f)
+        {
+            return cached.rgb;
+        }
+    }
+#endif
+    return WDGI_Sky(dir);
+}

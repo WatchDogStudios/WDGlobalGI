@@ -1,0 +1,205 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI screen-probe integrate (audit #2 + #7 specular). Per lit pixel:
+ *  - Diffuse: bilinearly interpolate the 4 surrounding probes' irradiance SH (depth-bilateral weighted
+ *    to avoid leaking across discontinuities), evaluate for the pixel normal -> indirect diffuse.
+ *  - Specular: sample the nearest probe's octahedral radiance in the reflection direction -> glossy GI.
+ * Add-blended into the lighting target. Brightness matches the clipmap composite (no extra /PI - the
+ * BRDF /PI cancels the cosine-integral PI).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexUtil.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexInfo.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float4> m_albedo;
+    Texture2DMS<float4> m_normal;
+    Texture2DMS<float>  m_depth;
+    Texture2D<float4>   m_screenProbeSH;     // 9 irradiance-SH coeffs per probe (diffuse)
+    Texture2D<float4>   m_screenProbeAtlas;  // octahedral radiance (specular)
+    Texture2D<float4>   m_screenProbeDepthAtlas; // octahedral depth moments for Chebyshev visibility
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+    float m_screenProbeSpecular;
+    float m_specularRoughness;  // glossy cone width (0 = sharp mirror, 1 = blurry)
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Reconstruct the world position of a probe (tile centre) from the G-buffer depth.
+bool ProbeWorldPos(int2 tile, uint2 screenRes, out float3 worldPos)
+{
+    uint2 probePixel = min(uint2(tile) * uint(WDGI_SP_TILE) + (WDGI_SP_TILE / 2), screenRes - uint2(1, 1));
+    float d = PassSrg::m_depth.Load(int2(probePixel), 0).r;
+    if (d <= 0.0f)
+    {
+        worldPos = float3(0, 0, 0);
+        return false;
+    }
+    float2 uv = (float2(probePixel) + 0.5f) / float2(screenRes);
+    worldPos = WDGI_ReconstructWorldPos(uv, d);
+    return true;
+}
+
+// DDGI-style Chebyshev visibility: how visible the shading point is from a probe, using the probe's
+// octahedral depth moments (mean + mean^2 hit distance). This is what makes the interpolation leak-free
+// and sharp at contacts - a probe occluded from the pixel (e.g. behind a wall) gets ~zero weight.
+float ChebyshevVisibility(int2 tile, float3 probeWorld, float3 worldPos)
+{
+    float3 toPixel = worldPos - probeWorld;
+    float dist = length(toPixel);
+    if (dist < 1e-3f)
+    {
+        return 1.0f;
+    }
+    float3 dir = toPixel / dist;
+    float2 octaUV = WDGI_OctaEncode(dir);
+    uint2 texel = uint2(tile) * uint(WDGI_SP_OCTA) + uint2(saturate(octaUV) * float(WDGI_SP_OCTA - 1));
+    float2 moments = PassSrg::m_screenProbeDepthAtlas.Load(int3(texel, 0)).rg;
+
+    float mean = moments.x;
+    if (dist <= mean)
+    {
+        return 1.0f; // the probe sees the point along this direction -> fully visible
+    }
+    float variance = abs(moments.y - mean * mean);
+    float softFloor = mean * 0.08f;             // relative floor -> a soft transition, not a hard cutoff
+    variance = max(variance, softFloor * softFloor);
+    float d = dist - mean;
+    float cheb = variance / (variance + d * d);
+    return max(cheb * cheb, 0.04f);             // sharpen, with a small floor so nothing goes fully black
+}
+
+VSOutput MainVS(VSInput input)
+{
+    VSOutput OUT;
+    float4 posTex = GetVertexPositionAndTexCoords(input.m_vertexID);
+    OUT.m_texCoord = float2(posTex.z, posTex.w);
+    OUT.m_position = float4(posTex.x, posTex.y, 0.0f, 1.0f);
+    return OUT;
+}
+
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+    OUT.m_color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    uint2 coords = uint2(IN.m_position.xy);
+    float depth = PassSrg::m_depth.Load(coords, 0).r;
+    if (depth <= 0.0f)
+    {
+        return OUT;
+    }
+
+    float3 normal = DecodeNormalSignedOctahedron(PassSrg::m_normal.Load(coords, 0).rgb);
+    float3 albedo = PassSrg::m_albedo.Load(coords, 0).rgb;
+    float3 worldPos = WDGI_ReconstructWorldPos(IN.m_texCoord, depth);
+
+    uint2 screenRes = PassSrg::m_screenProbeInfo.xy;
+    int2 maxTile = int2(PassSrg::m_screenProbeInfo.zw) - 1;
+
+    // Probe-grid coordinate (probe centres sit at integer indices).
+    float2 probeCoord = float2(coords) / float(WDGI_SP_TILE) - 0.5f;
+    int2 baseTile = int2(floor(probeCoord));
+    float2 frac = probeCoord - float2(baseTile);
+
+    // Bilinear + Chebyshev-visibility accumulation of the 9 irradiance-SH coefficients (DDGI-style):
+    // each of the 4 surrounding probes is weighted by how visible this pixel is from it, which kills
+    // light leaking across walls and sharpens contact - the main thing separating us from DDGI before.
+    float3 shAccum[9];
+    [unroll] for (int k = 0; k < 9; ++k)
+    {
+        shAccum[k] = float3(0, 0, 0);
+    }
+    float weightSum = 0.0f;
+
+    [unroll] for (int j = 0; j < 2; ++j)
+    {
+        [unroll] for (int i = 0; i < 2; ++i)
+        {
+            int2 tile = clamp(baseTile + int2(i, j), int2(0, 0), maxTile);
+            float bilinear = (i == 0 ? (1.0f - frac.x) : frac.x) * (j == 0 ? (1.0f - frac.y) : frac.y);
+
+            float3 probeWorld;
+            float visibility = 0.0f;
+            if (ProbeWorldPos(tile, screenRes, probeWorld))
+            {
+                visibility = ChebyshevVisibility(tile, probeWorld, worldPos);
+            }
+
+            float w = bilinear * visibility;
+            if (w > 0.0f)
+            {
+                uint2 shBase = uint2(uint(tile.x) * uint(WDGI_SP_COEFFS), uint(tile.y));
+                [unroll] for (int k = 0; k < 9; ++k)
+                {
+                    shAccum[k] += PassSrg::m_screenProbeSH.Load(int3(shBase + uint2(k, 0), 0)).rgb * w;
+                }
+                weightSum += w;
+            }
+        }
+    }
+
+    float3 diffuseGI = float3(0, 0, 0);
+    if (weightSum > 1e-4f)
+    {
+        float invW = 1.0f / weightSum;
+        float3 coeffs[9];
+        [unroll] for (int k = 0; k < 9; ++k)
+        {
+            coeffs[k] = shAccum[k] * invW;
+        }
+        float3 irradiance = WDGI_SHEvalIrradiance(coeffs, normal);
+        // L_out = (albedo/PI) * E (E is the cosine-convolved SH irradiance).
+        diffuseGI = (albedo / WDGI_PI) * irradiance * PassSrg::m_giIntensity;
+    }
+
+    // Glossy specular: gather the nearest probe's octahedral radiance in a roughness-driven cone around
+    // the reflection direction (5 taps: centre + a tangent-plane ring whose spread scales with
+    // m_specularRoughness). A sharp mirror collapses the ring onto the reflection ray; a rough surface
+    // widens it, blurring the reflection. Single-probe (no per-pixel roughness gbuffer) - the cone width
+    // is a global slider, which is a pragmatic step up from the previous single tap.
+    float3 specularGI = float3(0, 0, 0);
+    if (PassSrg::m_screenProbeSpecular > 0.0f)
+    {
+        int2 nearTile = clamp(int2(round(probeCoord)), int2(0, 0), maxTile);
+        float3 viewDir = normalize(WDGI_ReconstructWorldPos(IN.m_texCoord, 1.0f) - worldPos);
+        float3 reflDir = reflect(-viewDir, normal);
+
+        // Tangent frame around the reflection direction for the cone offsets.
+        float3 up = abs(reflDir.z) < 0.99f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+        float3 tangent = normalize(cross(up, reflDir));
+        float3 bitangent = cross(reflDir, tangent);
+        float spread = saturate(PassSrg::m_specularRoughness) * 0.6f;
+
+        const float2 coneOffsets[5] =
+        {
+            float2(0.0f, 0.0f), float2(1.0f, 0.0f), float2(-1.0f, 0.0f), float2(0.0f, 1.0f), float2(0.0f, -1.0f)
+        };
+        float3 reflRadiance = float3(0.0f, 0.0f, 0.0f);
+        [unroll] for (int s = 0; s < 5; ++s)
+        {
+            float3 d = normalize(reflDir + (tangent * coneOffsets[s].x + bitangent * coneOffsets[s].y) * spread);
+            float2 octaUV = WDGI_OctaEncode(d);
+            uint2 octaTexel = uint2(nearTile) * uint(WDGI_SP_OCTA) + uint2(saturate(octaUV) * float(WDGI_SP_OCTA - 1));
+            reflRadiance += PassSrg::m_screenProbeAtlas.Load(int3(octaTexel, 0)).rgb;
+        }
+        reflRadiance *= 0.2f; // average of 5 taps
+
+        specularGI = reflRadiance * PassSrg::m_screenProbeSpecular;
+    }
+
+    OUT.m_color = float4(diffuseGI + specularGI, 1.0f);
+    return OUT;
+}

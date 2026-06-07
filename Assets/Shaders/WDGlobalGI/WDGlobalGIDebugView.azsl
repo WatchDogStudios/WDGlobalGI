@@ -1,0 +1,223 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI debug visualization (fullscreen, overwrites the target). A proper DDA (Amanatides & Woo)
+ * voxel ray-march from the camera gives crisp, face-shaded cubes (so the voxel scene reads like the
+ * Dagor debug view) and recovers the entry face normal for shading. Modes (m_debugViewMode):
+ *   1 = Lit Voxels    : the GI-lit voxel radiance, face-shaded.
+ *   2 = Voxel Scene   : stored albedo, face-shaded (the clean "voxelized scene" preview).
+ *   3 = Voxel Normals : per-voxel surface normal (falls back to the cube face normal).
+ *   4 = Cascades      : voxels coloured by which clipmap cascade they live in.
+ *   5 = Irradiance    : the per-surface GI irradiance field (from the G-buffer).
+ *   6 = Trace Steps   : DDA step-count heat map (trace cost / SDF efficiency).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexUtil.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexInfo.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float4> m_normal;       // G-buffer normal (irradiance-field mode)
+    Texture2DMS<float>  m_depth;        // G-buffer depth (irradiance-field mode)
+    Texture3D<float4>   m_radianceClipmap;
+    Texture3D<float>    m_sdfClipmap;
+    Texture3D<float4>   m_irradianceClipmap;
+    Texture3D<float4>   m_albedoClipmap;
+    Texture3D<float4>   m_voxelNormalClipmap;
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// Subtle per-face shading (fixed key light from above + ambient) so the blocky voxel structure reads.
+float WDGI_FaceShade(float3 n)
+{
+    float3 keyDir = normalize(float3(0.30f, 0.25f, 0.90f));
+    return 0.45f + 0.55f * saturate(dot(n, keyDir));
+}
+
+float3 WDGI_CascadeColor(int c)
+{
+    if (c == 0) return float3(1.0f, 0.35f, 0.35f);
+    if (c == 1) return float3(0.35f, 1.0f, 0.45f);
+    if (c == 2) return float3(0.40f, 0.55f, 1.0f);
+    return float3(1.0f, 0.9f, 0.35f);
+}
+
+// Blue (cheap) -> green -> red (expensive) ramp for the step-count heat map.
+float3 WDGI_Heat(float t)
+{
+    t = saturate(t);
+    return saturate(float3(t * 2.0f - 1.0f, 1.0f - abs(t * 2.0f - 1.0f), 1.0f - t * 2.0f));
+}
+
+struct VoxelHit
+{
+    bool   hit;
+    float3 normal;   // cube face normal the ray entered through
+    int3   texel;    // radiance / albedo / voxel-normal texel at the hit
+    int3   physical;
+    int    cascade;
+    int    steps;
+};
+
+// DDA voxel traversal of the radiance clipmap. Steps voxel-by-voxel (within each cascade's cell grid),
+// recovering the crossed-face normal, until it hits an occupied voxel or leaves the volume.
+VoxelHit MarchVoxels(float3 origin, float3 dir)
+{
+    VoxelHit h;
+    h.hit = false;
+    h.normal = float3(0.0f, 0.0f, 1.0f);
+    h.texel = int3(0, 0, 0);
+    h.physical = int3(0, 0, 0);
+    h.cascade = -1;
+    h.steps = 0;
+
+    // Keep the direction away from exactly zero so the per-axis division is finite.
+    float3 sdir = dir;
+    sdir.x = (abs(sdir.x) < 1e-6f) ? (sdir.x >= 0.0f ? 1e-6f : -1e-6f) : sdir.x;
+    sdir.y = (abs(sdir.y) < 1e-6f) ? (sdir.y >= 0.0f ? 1e-6f : -1e-6f) : sdir.y;
+    sdir.z = (abs(sdir.z) < 1e-6f) ? (sdir.z >= 0.0f ? 1e-6f : -1e-6f) : sdir.z;
+
+    float3 pos = origin;
+    float3 enterNormal = -sign(sdir); // approximate face for the first voxel
+
+    [loop] for (int s = 0; s < 256; ++s)
+    {
+        int c = WDGI_SelectCascade(pos);
+        if (c < 0)
+        {
+            break; // left the volume
+        }
+        float cell = WDGI_CascadeCellSize(c);
+        int3 voxel = int3(floor(pos / cell));
+        int3 physical = WDGI_PhysicalCell(voxel);
+        int3 texel = WDGI_RadianceTexel(physical, c);
+
+        if (PassSrg::m_radianceClipmap.Load(int4(texel, 0)).a > 0.5f)
+        {
+            h.hit = true;
+            h.normal = enterNormal;
+            h.texel = texel;
+            h.physical = physical;
+            h.cascade = c;
+            h.steps = s;
+            return h;
+        }
+
+        // Advance to the next voxel boundary in this cascade's grid (Amanatides & Woo).
+        float3 voxelMin = float3(voxel) * cell;
+        float3 planes = voxelMin + step(0.0f, sdir) * cell;       // far face for +dir, near face for -dir
+        float3 tToPlane = (planes - pos) / sdir;                  // ray distance to each axis boundary (>0)
+
+        bool ax = (tToPlane.x <= tToPlane.y) && (tToPlane.x <= tToPlane.z);
+        bool ay = !ax && (tToPlane.y <= tToPlane.z);
+        bool az = !ax && !ay;
+        float3 axisMask = float3(ax ? 1.0f : 0.0f, ay ? 1.0f : 0.0f, az ? 1.0f : 0.0f);
+
+        float tStep = min(tToPlane.x, min(tToPlane.y, tToPlane.z));
+        enterNormal = -sign(sdir) * axisMask;
+        pos += sdir * (tStep + cell * 1e-3f); // nudge just across the boundary
+        h.steps = s;
+    }
+
+    return h;
+}
+
+float3 SampleIrradianceField(float3 worldPos, float3 normal)
+{
+    int c = WDGI_SelectCascade(worldPos);
+    if (c < 0)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    int3 physical = WDGI_PhysicalCell(WDGI_WorldCell(worldPos, c));
+    float3 faceColors[WDGLOBALGI_FACE_COUNT];
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        faceColors[f] = PassSrg::m_irradianceClipmap.Load(int4(WDGI_IrradianceTexel(physical, c, f), 0)).rgb;
+    }
+    return WDGI_EvalAmbientCube(faceColors, normal);
+}
+
+VSOutput MainVS(VSInput input)
+{
+    VSOutput OUT;
+    float4 posTex = GetVertexPositionAndTexCoords(input.m_vertexID);
+    OUT.m_texCoord = float2(posTex.z, posTex.w);
+    OUT.m_position = float4(posTex.x, posTex.y, 0.0f, 1.0f);
+    return OUT;
+}
+
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+    float2 uv = IN.m_texCoord;
+    uint2 coords = uint2(IN.m_position.xy);
+    uint mode = PassSrg::m_debugViewMode;
+
+    float3 color = float3(0.02f, 0.02f, 0.03f); // dim background
+
+    // Mode 5: irradiance field is a per-surface (G-buffer) view, not a voxel march.
+    if (mode == 5u)
+    {
+        float depth = PassSrg::m_depth.Load(coords, 0).r;
+        if (depth > 0.0f)
+        {
+            float3 worldPos = WDGI_ReconstructWorldPos(uv, depth);
+            float3 normal = DecodeNormalSignedOctahedron(PassSrg::m_normal.Load(coords, 0).rgb);
+            color = SampleIrradianceField(worldPos, normal);
+        }
+        OUT.m_color = float4(color, 1.0f);
+        return OUT;
+    }
+
+    // Voxel-march modes (1-4, 6).
+    float3 nearPos = WDGI_ReconstructWorldPos(uv, 1.0f);
+    float3 farPos  = WDGI_ReconstructWorldPos(uv, 0.0001f);
+    float3 dir = normalize(farPos - nearPos);
+
+    VoxelHit h = MarchVoxels(nearPos, dir);
+
+    if (mode == 6u) // Trace-step heat map (does not require a hit)
+    {
+        color = WDGI_Heat(float(h.steps) / 96.0f);
+        OUT.m_color = float4(color, 1.0f);
+        return OUT;
+    }
+
+    if (h.hit)
+    {
+        float shade = WDGI_FaceShade(h.normal);
+        if (mode == 1u) // Lit voxels
+        {
+            float3 radiance = PassSrg::m_radianceClipmap.Load(int4(h.texel, 0)).rgb;
+            color = radiance * (0.6f + 0.4f * shade); // mostly the GI radiance, with a touch of face shading
+        }
+        else if (mode == 2u) // Voxel scene (albedo)
+        {
+            float3 albedo = PassSrg::m_albedoClipmap.Load(int4(h.texel, 0)).rgb;
+            color = albedo * shade;
+        }
+        else if (mode == 3u) // Voxel normals
+        {
+            float4 vn = PassSrg::m_voxelNormalClipmap.Load(int4(h.texel, 0));
+            color = (vn.a > 0.5f) ? vn.rgb : (h.normal * 0.5f + 0.5f);
+        }
+        else // mode == 4u : cascades
+        {
+            color = WDGI_CascadeColor(h.cascade) * shade;
+        }
+    }
+
+    OUT.m_color = float4(color, 1.0f);
+    return OUT;
+}

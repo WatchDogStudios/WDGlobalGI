@@ -1,0 +1,42 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Standalone definition of the WDGlobalGI shared constant macro. Include this BEFORE declaring the
+ * shader's PassSrg block so the macro is expanded into the SRG. The behavioural helpers in
+ * WDGlobalGICommon.azsli reference PassSrg members and therefore must be included AFTER the SRG.
+ */
+
+#pragma once
+
+#define WDGLOBALGI_MAX_CASCADES 4
+#define WDGLOBALGI_FACE_COUNT   6
+
+//! The standard constant block shared by every WDGlobalGI pass SRG. The layout (names + types) is
+//! mirrored by WDGlobalGIClipmap::FillSharedConstants on the C++ side.
+#define WDGLOBALGI_SHARED_CONSTANTS                                                                  \
+    uint3  m_gridResolution;                                                                         \
+    uint   m_cascadeCount;                                                                           \
+    float4 m_cascadeCenterAndCell[WDGLOBALGI_MAX_CASCADES]; /* xyz=centerCell, w=cellSize */         \
+    float4 m_sunDirectionIntensity;  /* xyz = direction toward surface, w = intensity */             \
+    float4 m_sunColor;               /* rgb */                                                       \
+    float4 m_skyColorIntensity;      /* rgb = colour, a = intensity */                               \
+    row_major float4x4 m_clipToWorld; /* inverse view-projection, for depth->world reconstruction */ \
+    float  m_giIntensity;                                                                            \
+    float  m_hysteresis;                                                                             \
+    uint   m_raysPerProbe;                                                                           \
+    uint   m_maxRaySteps;                                                                            \
+    uint   m_frameIndex;                                                                             \
+    float  m_probeUpdateFraction;                                                                    \
+    uint   m_updateDivisor;          /* update 1/N of probe Z-slabs per frame (round-robin) */       \
+    float  m_sceneBlend;             /* voxel injection moving-average weight toward history */       \
+    uint   m_debugViewMode;          /* 0=off,1=voxel radiance,2=irradiance,3=occupancy */           \
+    float  m_leakReduction;          /* 0=isotropic, 1=attenuate back-facing voxel hits */            \
+    uint   m_clearAll;               /* 1 = clear every voxel this frame (post-invalidation) */        \
+    float4 m_prevCascadeCenterAndCell[WDGLOBALGI_MAX_CASCADES]; /* xyz = previous-frame center cell */  \
+    uint   m_anisotropic;            /* 1 = sample 6-direction anisotropic voxel radiance (#4) */       \
+    uint   m_useRadianceCache;       /* 1 = escaped/long rays reuse the cached world irradiance (#8) */  \
+    row_major float4x4 m_prevWorldToClip; /* last frame's view-proj, for screen-probe reprojection */    \
+    float  m_cascadeBlend;           /* 0 = hard cascade boundaries, 1 = blend across them (anti-seam) */

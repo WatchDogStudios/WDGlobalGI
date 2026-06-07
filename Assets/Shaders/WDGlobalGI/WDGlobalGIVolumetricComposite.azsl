@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI volumetric composite (audit #7). Fullscreen pass that, for each pixel, looks up the
+ * accumulated in-scattered GI from the froxel volume at the pixel's view depth and ADD-blends it into
+ * the lighting target (One/One), so volumetric fog lit by the GI glows in front of geometry and across
+ * the sky. The absorption term is intentionally omitted (additive in-scatter only), matching the
+ * additive composite infrastructure used by the clipmap Apply pass.
+ */
+
+#include <viewsrg_all.srgi>
+
+#include <Atom/Features/PostProcessing/FullscreenVertexUtil.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertexInfo.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+#define WDGI_FROXEL_X 160
+#define WDGI_FROXEL_Y 90
+#define WDGI_FROXEL_Z 64
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    // Depth is auto-bound from the DepthInput slot (declared first to match the slot order).
+    Texture2DMS<float> m_depth;
+    Texture3D<float4>  m_volumetricFroxel; // accumulated in-scatter (bound from C++)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    float m_volumetricMaxDistance;
+}
+
+#include <WDGlobalGICommon.azsli>
+
+VSOutput MainVS(VSInput input)
+{
+    VSOutput OUT;
+    float4 posTex = GetVertexPositionAndTexCoords(input.m_vertexID);
+    OUT.m_texCoord = float2(posTex.z, posTex.w);
+    OUT.m_position = float4(posTex.x, posTex.y, 0.0f, 1.0f);
+    return OUT;
+}
+
+PSOutput MainPS(VSOutput IN, in uint sampleIndex : SV_SampleIndex)
+{
+    PSOutput OUT;
+    OUT.m_color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    uint2 coords = uint2(IN.m_position.xy);
+    float depth = PassSrg::m_depth.Load(coords, sampleIndex).r;
+
+    // Map the pixel's view distance to a froxel Z slice. Reverse-Z: depth 1 = near plane (slice 0).
+    // Sky / background (depth 0) reads the full fog column.
+    float sliceT;
+    if (depth <= 0.0f)
+    {
+        sliceT = (float(WDGI_FROXEL_Z) - 0.5f) / float(WDGI_FROXEL_Z);
+    }
+    else
+    {
+        float3 nearPos = WDGI_ReconstructWorldPos(IN.m_texCoord, 1.0f);
+        float3 worldPos = WDGI_ReconstructWorldPos(IN.m_texCoord, depth);
+        sliceT = saturate(length(worldPos - nearPos) / max(PassSrg::m_volumetricMaxDistance, 1.0f));
+    }
+
+    // Point-load the froxel at the pixel's column + slice (low-frequency in-scatter, like every other
+    // clipmap read in this gem - avoids needing a sampler-bound view).
+    uint3 froxelCoord = uint3(
+        min((uint)(IN.m_texCoord.x * float(WDGI_FROXEL_X)), uint(WDGI_FROXEL_X - 1)),
+        min((uint)(IN.m_texCoord.y * float(WDGI_FROXEL_Y)), uint(WDGI_FROXEL_Y - 1)),
+        min((uint)(sliceT * float(WDGI_FROXEL_Z)), uint(WDGI_FROXEL_Z - 1)));
+    float3 inScatter = PassSrg::m_volumetricFroxel.Load(int4(int3(froxelCoord), 0)).rgb;
+    OUT.m_color = float4(inScatter, 1.0f);
+    return OUT;
+}

@@ -1,0 +1,104 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI screen-space probe trace (audit #2 + #3). One probe per WDGI_SP_TILE screen tile; this
+ * pass dispatches one thread per probe octahedral texel (atlas pixel), reconstructs the probe's world
+ * position from the G-buffer at the tile centre, sphere-traces that octahedral direction through the
+ * voxel scene, and temporally blends the radiance into the persistent octahedral atlas. The atlas is
+ * the daGI2-style octahedral radiance encoding, applied where it matters most: the per-pixel layer.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float>  m_depth;            // G-buffer depth (probe placement)
+    Texture3D<float4>   m_radianceClipmap;
+    Texture3D<float>    m_sdfClipmap;
+    Texture3D<float4>   m_voxelNormalClipmap; // surface normal for leak reduction
+    Texture3D<float4>   m_anisoRadianceClipmap; // 6-direction radiance (#4)
+    Texture3D<float4>   m_irradianceClipmap;    // world irradiance cache far-field (#8)
+    RWTexture2D<float4> m_screenProbeAtlas;  // octahedral radiance (rgb), a = valid; temporal/reproject
+    Texture2D<float4>   m_screenProbeHistory;   // previous-frame atlas for motion reprojection (#2)
+    RWTexture2D<float4> m_screenProbeDepthAtlas; // octahedral hit-distance moments (rg = mean, mean^2) for Chebyshev
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+    float m_screenProbeTemporal;
+}
+
+#include <WDGlobalGICommon.azsli>
+// Enable the radiance cache (#8) for the screen-probe far-field; our irradiance is a read-only Texture3D.
+#define WDGI_TRACE_USE_CACHE
+#include <WDGlobalGITrace.azsli>
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint2 atlasCoord = dispatch_id.xy;
+    uint tilesX = PassSrg::m_screenProbeInfo.z;
+    uint tilesY = PassSrg::m_screenProbeInfo.w;
+    if (atlasCoord.x >= tilesX * WDGI_SP_OCTA || atlasCoord.y >= tilesY * WDGI_SP_OCTA)
+    {
+        return;
+    }
+
+    uint2 tile = atlasCoord / WDGI_SP_OCTA;
+    uint2 octa = atlasCoord % WDGI_SP_OCTA;
+
+    uint2 screenRes = PassSrg::m_screenProbeInfo.xy;
+    uint2 probePixel = min(tile * WDGI_SP_TILE + (WDGI_SP_TILE / 2), screenRes - uint2(1, 1));
+
+    float depth = PassSrg::m_depth.Load(int2(probePixel), 0).r;
+
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    float4 prev = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // Distance from the probe to the first surface along this octa direction. Clamped to 200 m so the
+    // squared value still fits an fp16 atlas (200^2 = 40000 < 65504); 'far'/miss reads as 200 (visible).
+    float storedDist = 200.0f;
+
+    if (depth > 0.0f)
+    {
+        float2 uv = (float2(probePixel) + 0.5f) / float2(screenRes);
+        float3 worldPos = WDGI_ReconstructWorldPos(uv, depth);
+
+        // Trace this octahedral direction through the voxel scene. Start ~1.5 finest-cells off the
+        // surface so away-facing rays escape the probe's own voxel.
+        float3 dir = WDGI_OctaDecode((float2(octa) + 0.5f) / float(WDGI_SP_OCTA));
+        float cell0 = PassSrg::m_cascadeCenterAndCell[0].w;
+        float hitDist;
+        radiance = WDGI_TraceVoxelRay(worldPos + dir * (cell0 * 1.5f), dir, hitDist);
+        storedDist = min(hitDist + cell0 * 1.5f, 200.0f); // from the probe surface; clamp for fp16 (see above)
+
+        // Motion reprojection (#2): project this surface by LAST frame's view-proj to find where the
+        // probe was on screen, and read the history atlas there. This keeps temporal history aligned as
+        // the camera moves (far less ghosting than a fixed-tile in-place blend). The atlas ping-pongs:
+        // we write the "current" atlas and read the "previous" one.
+        float4 prevClip = mul(PassSrg::m_prevWorldToClip, float4(worldPos, 1.0f));
+        if (prevClip.w > 1e-4f)
+        {
+            float2 prevNdc = prevClip.xy / prevClip.w;
+            float2 prevUv = float2(prevNdc.x * 0.5f + 0.5f, 0.5f - prevNdc.y * 0.5f);
+            if (prevUv.x >= 0.0f && prevUv.x <= 1.0f && prevUv.y >= 0.0f && prevUv.y <= 1.0f)
+            {
+                uint2 prevTile = (uint2)(prevUv * float2(screenRes) / float(WDGI_SP_TILE));
+                prevTile = min(prevTile, uint2(tilesX - 1u, tilesY - 1u));
+                uint2 prevAtlasCoord = prevTile * uint(WDGI_SP_OCTA) + octa;
+                prev = PassSrg::m_screenProbeHistory.Load(int3(prevAtlasCoord, 0));
+            }
+        }
+    }
+
+    float hist = (prev.a > 0.0f) ? PassSrg::m_screenProbeTemporal : 0.0f;
+    float3 blended = lerp(radiance, prev.rgb, hist);
+    PassSrg::m_screenProbeAtlas[atlasCoord] = float4(blended, 1.0f);
+
+    // Depth moments (mean, mean^2) for DDGI-style Chebyshev visibility. The per-direction distance is
+    // deterministic per frame, so it's written fresh (no temporal / reprojection needed).
+    PassSrg::m_screenProbeDepthAtlas[atlasCoord] = float4(storedDist, storedDist * storedDist, 0.0f, 1.0f);
+}

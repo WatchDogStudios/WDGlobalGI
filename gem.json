@@ -1,0 +1,37 @@
+{
+    "gem_name": "WDGlobalGI",
+    "display_name": "WD Global Illumination (Dagor GI)",
+    "license": "Apache-2.0 OR MIT",
+    "license_url": "https://github.com/o3de/o3de/blob/development/LICENSE.txt",
+    "origin": "WD Studios",
+    "origin_url": "https://git.wdstudios.tech/internal/engine",
+    "type": "Code",
+    "summary": "Scalable real-time dynamic global illumination for large scenes, based on Gaijin Entertainment's Dagor GI solution (Yudintsev, 'Scalable Real-time Global Illumination for Large Scenes').",
+    "canonical_tags": [
+        "Gem"
+    ],
+    "user_tags": [
+        "Renderer",
+        "Graphics",
+        "Lighting",
+        "GlobalIllumination",
+        "Environment"
+    ],
+    "icon_path": "preview.png",
+    "requirements": "",
+    "documentation_url": "",
+    "dependencies": [
+        "Atom_RPI",
+        "Atom",
+        "Atom_Feature_Common",
+        "ImGui"
+    ],
+    "repo_uri": "",
+    "version": "1.0.0",
+    "compatible_engines": [
+        "o3de>=2.0.0"
+    ],
+    "engine_api_dependencies": [
+        "Atom"
+    ]
+}

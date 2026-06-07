@@ -1,0 +1,53 @@
+#
+# Copyright (c) Contributors to the Open 3D Engine Project.
+# For complete copyright and license terms please see the LICENSE at the root of this distribution.
+#
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+
+set(FILES
+    Include/WDGlobalGI/WDGlobalGIConfiguration.h
+    Include/WDGlobalGI/WDGlobalGIFeatureProcessorInterface.h
+    Source/WDGlobalGIModule.h
+    Source/Clients/WDGlobalGISystemComponent.cpp
+    Source/Clients/WDGlobalGISystemComponent.h
+    Source/Components/WDGlobalGIComponent.cpp
+    Source/Components/WDGlobalGIComponent.h
+    Source/Components/WDGlobalGIComponentConfig.cpp
+    Source/Components/WDGlobalGIComponentConfig.h
+    Source/Components/WDGlobalGIComponentConstants.h
+    Source/Components/WDGlobalGIComponentController.cpp
+    Source/Components/WDGlobalGIComponentController.h
+    Source/Render/WDGlobalGIFeatureProcessor.cpp
+    Source/Render/WDGlobalGIFeatureProcessor.h
+    Source/Render/WDGlobalGIClipmap.cpp
+    Source/Render/WDGlobalGIClipmap.h
+    Source/Render/Passes/WDGlobalGIComputePass.cpp
+    Source/Render/Passes/WDGlobalGIComputePass.h
+    Source/Render/Passes/WDGlobalGIClearPass.cpp
+    Source/Render/Passes/WDGlobalGIClearPass.h
+    Source/Render/Passes/WDGlobalGISceneInjectPass.cpp
+    Source/Render/Passes/WDGlobalGISceneInjectPass.h
+    Source/Render/Passes/WDGlobalGISdfUpdatePass.cpp
+    Source/Render/Passes/WDGlobalGISdfUpdatePass.h
+    Source/Render/Passes/WDGlobalGIRelightPass.cpp
+    Source/Render/Passes/WDGlobalGIRelightPass.h
+    Source/Render/Passes/WDGlobalGIPropagatePass.cpp
+    Source/Render/Passes/WDGlobalGIPropagatePass.h
+    Source/Render/Passes/WDGlobalGIApplyPass.cpp
+    Source/Render/Passes/WDGlobalGIApplyPass.h
+    Source/Render/Passes/WDGlobalGIScreenProbeTracePass.cpp
+    Source/Render/Passes/WDGlobalGIScreenProbeTracePass.h
+    Source/Render/Passes/WDGlobalGIScreenProbeConvertPass.cpp
+    Source/Render/Passes/WDGlobalGIScreenProbeConvertPass.h
+    Source/Render/Passes/WDGlobalGIScreenProbeBlurPass.cpp
+    Source/Render/Passes/WDGlobalGIScreenProbeBlurPass.h
+    Source/Render/Passes/WDGlobalGIScreenProbeIntegratePass.cpp
+    Source/Render/Passes/WDGlobalGIScreenProbeIntegratePass.h
+    Source/Render/Passes/WDGlobalGIVolumetricPass.cpp
+    Source/Render/Passes/WDGlobalGIVolumetricPass.h
+    Source/Render/Passes/WDGlobalGIVolumetricCompositePass.cpp
+    Source/Render/Passes/WDGlobalGIVolumetricCompositePass.h
+    Source/Render/Passes/WDGlobalGIDebugPass.cpp
+    Source/Render/Passes/WDGlobalGIDebugPass.h
+)

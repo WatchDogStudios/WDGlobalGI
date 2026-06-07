@@ -1,0 +1,123 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "WDGlobalGIParentPassTemplate",
+            "PassClass": "ParentPass",
+            "Slots": [
+                {
+                    "Name": "AlbedoInput",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "NormalInput",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
+                    "Name": "DepthStencilInputOutput",
+                    "SlotType": "InputOutput",
+                    "ScopeAttachmentUsage": "DepthStencil"
+                },
+                {
+                    "Name": "DiffuseInputOutput",
+                    "SlotType": "InputOutput",
+                    "ScopeAttachmentUsage": "RenderTarget"
+                }
+            ],
+            "PassRequests": [
+                {
+                    "Name": "WDGlobalGIClearPass",
+                    "TemplateName": "WDGlobalGIClearPassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGISceneInjectPass",
+                    "TemplateName": "WDGlobalGISceneInjectPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth",   "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "Normal",  "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } },
+                        { "LocalSlot": "Albedo",  "AttachmentRef": { "Pass": "Parent", "Attachment": "AlbedoInput" } },
+                        { "LocalSlot": "Lighting", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGISdfUpdatePass",
+                    "TemplateName": "WDGlobalGISdfUpdatePassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGIRelightPass",
+                    "TemplateName": "WDGlobalGIRelightPassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGIPropagatePass",
+                    "TemplateName": "WDGlobalGIPropagatePassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGIScreenProbeTracePass",
+                    "TemplateName": "WDGlobalGIScreenProbeTracePassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth", "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIScreenProbeConvertPass",
+                    "TemplateName": "WDGlobalGIScreenProbeConvertPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth", "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIScreenProbeBlurPass",
+                    "TemplateName": "WDGlobalGIScreenProbeBlurPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth", "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIApplyPass",
+                    "TemplateName": "WDGlobalGIApplyPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "AlbedoInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "AlbedoInput" } },
+                        { "LocalSlot": "NormalInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } },
+                        { "LocalSlot": "DepthInput",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "DiffuseInputOutput", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIScreenProbeIntegratePass",
+                    "TemplateName": "WDGlobalGIScreenProbeIntegratePassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "AlbedoInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "AlbedoInput" } },
+                        { "LocalSlot": "NormalInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } },
+                        { "LocalSlot": "DepthInput",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "DiffuseInputOutput", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIVolumetricPass",
+                    "TemplateName": "WDGlobalGIVolumetricPassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGIVolumetricCompositePass",
+                    "TemplateName": "WDGlobalGIVolumetricCompositePassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "DepthInput",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "DiffuseInputOutput", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIDebugPass",
+                    "TemplateName": "WDGlobalGIDebugPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Normal", "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } },
+                        { "LocalSlot": "Depth",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "DiffuseInputOutput", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
+                    ]
+                }
+            ]
+        }
+    }
+}

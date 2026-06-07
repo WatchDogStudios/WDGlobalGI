@@ -1,0 +1,99 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI irradiance propagation pass. Each frame updates 1/m_updateDivisor of the probe Z-slabs
+ * (round-robin), casting m_raysPerProbe rays per probe through the voxel-radiance clipmap and
+ * accumulating into a 6-face HL2 Ambient Cube with a temporal moving average. The round-robin is done
+ * by dispatching fewer threads (not by masking), so the cost actually scales with 1/m_updateDivisor.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture3D<float4>   m_radianceClipmap;
+    Texture3D<float>    m_sdfClipmap;          // distance-to-surface in cells (sphere tracing)
+    Texture3D<float4>   m_voxelNormalClipmap;  // surface normal for leak reduction
+    Texture3D<float4>   m_anisoRadianceClipmap; // 6-direction radiance (#4)
+    RWTexture3D<float4> m_irradianceClipmap;    // written here; also read by the radiance cache (#8)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+// Enable the radiance cache (#8) for the world-irradiance bounce; our irradiance is a RWTexture3D.
+#define WDGI_TRACE_USE_CACHE
+#define WDGI_IRRADIANCE_RW
+#include <WDGlobalGITrace.azsli>
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    int3 res = WDGI_GridRes();
+    uint divisor = max(PassSrg::m_updateDivisor, 1u);
+    uint totalZ = (uint)res.z * PassSrg::m_cascadeCount;
+
+    // Round-robin: this frame's dispatch only covers every divisor-th Z slab, offset by the phase.
+    uint phase = PassSrg::m_frameIndex % divisor;
+    uint actualZ = dispatch_id.z * divisor + phase;
+
+    if (dispatch_id.x >= (uint)res.x || dispatch_id.y >= (uint)res.y || actualZ >= totalZ)
+    {
+        return;
+    }
+
+    int cascade = (int)(actualZ / (uint)res.z);
+    int physicalZ = (int)(actualZ % (uint)res.z);
+    int3 physical = int3(int2(dispatch_id.xy), physicalZ);
+
+    // Probe world-space centre (centre of the cell).
+    int3 liveCell = WDGI_LiveWorldCell(physical, cascade);
+    float cell = WDGI_CascadeCellSize(cascade);
+    float3 origin = (float3(liveCell) + 0.5f) * cell;
+
+    uint probeIndex = (uint)physical.x +
+                      (uint)physical.y * (uint)res.x +
+                      actualZ * (uint)(res.x * res.y);
+    uint rng = WDGI_Hash(probeIndex + PassSrg::m_frameIndex * 2654435761u);
+
+    // Cast a budget of rays and accumulate into a 6-face ambient cube.
+    float3 accum[WDGLOBALGI_FACE_COUNT];
+    float  weights[WDGLOBALGI_FACE_COUNT];
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        accum[f] = float3(0, 0, 0);
+        weights[f] = 0.0f;
+    }
+
+    uint rayCount = max(PassSrg::m_raysPerProbe, 1u);
+    [loop] for (uint r = 0; r < rayCount; ++r)
+    {
+        float3 dir = WDGI_SphereDir(r, rayCount, rng + r);
+        float traceDist; // unused by propagate (the depth/Chebyshev term is a screen-probe feature)
+        float3 radiance = WDGI_TraceVoxelRay(origin + dir * (cell * 0.51f), dir, traceDist);
+
+        [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+        {
+            float w = saturate(dot(dir, WDGI_AmbientCubeDir(f)));
+            accum[f]   += radiance * w;
+            weights[f] += w;
+        }
+    }
+
+    // Normalise and blend against the previous value (temporal moving average / hysteresis).
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        float3 newColor = accum[f] / max(weights[f], 1e-4f);
+
+        int3 texel = WDGI_IrradianceTexel(physical, cascade, f);
+        float4 prev = PassSrg::m_irradianceClipmap[texel];
+        float hist = (prev.a > 0.0f) ? PassSrg::m_hysteresis : 0.0f;
+        float3 blended = lerp(newColor, prev.rgb, hist);
+
+        PassSrg::m_irradianceClipmap[texel] = float4(blended, 1.0f);
+    }
+}

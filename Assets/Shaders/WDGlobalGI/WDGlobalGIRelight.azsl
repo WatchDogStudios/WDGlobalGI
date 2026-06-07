@@ -1,0 +1,159 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * WDGlobalGI relight (audit #5). Recomputes the lit radiance of EVERY occupied voxel each frame from
+ * its stored albedo + surface normal: direct sun (with an SDF-traced voxel shadow) + the indirect
+ * ambient cube. This lets dynamic time-of-day / sun movement update the whole voxel scene, not just
+ * the visible voxels the screen-feedback inject refreshes. Optional - only runs when relight is on,
+ * and then it overrides the radiance the inject wrote. Uses the config sun (set it to match the scene).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+// Mirrors the 48-byte 'DirectionalLight' element in
+// Atom/Features/PBR/Lights/LightStructures.azsli (bool m_affectsGI is stored as 4 bytes), so the
+// scene's directional-light StructuredBuffer can be read directly. We only consume m_direction (which
+// points toward the surface, matching m_sunDirectionIntensity), m_rgbIntensityLux (to pick the
+// brightest light) and m_affectsGI. Keeping the exact stride is what makes the indexing line up.
+struct WDGI_DirLight
+{
+    float3 m_direction;
+    float  m_angularRadius;
+    float3 m_rgbIntensityLux;
+    float  m_affectsGIFactor;
+    uint   m_affectsGI;
+    uint   m_lightingChannelMask;
+    float2 m_padding;
+};
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture3D<float4>   m_albedoClipmap;
+    Texture3D<float4>   m_voxelNormalClipmap;
+    Texture3D<float4>   m_irradianceClipmap;
+    Texture3D<float>    m_sdfClipmap;
+    RWTexture3D<float4> m_radianceClipmap; // read occupancy, write radiance
+    StructuredBuffer<WDGI_DirLight> m_directionalLights; // scene directional lights (auto-sun)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint m_autoSun;             // 1 = follow the brightest scene directional light's direction
+    uint m_sceneDirLightCount;  // number of entries in m_directionalLights
+}
+
+#include <WDGlobalGICommon.azsli>
+
+// SDF voxel shadow toward the sun. Returns 1 if occluded before escaping, 0 if it reaches the sky.
+float TraceShadow(float3 origin, float3 dir)
+{
+    float3 pos = origin;
+    [loop] for (uint s = 0; s < 32; ++s)
+    {
+        int c = WDGI_SelectCascade(pos);
+        if (c < 0)
+        {
+            return 0.0f; // escaped -> lit
+        }
+        float cell = WDGI_CascadeCellSize(c);
+        int3 texel = WDGI_RadianceTexel(WDGI_PhysicalCell(int3(floor(pos / cell))), c);
+        float sdf = PassSrg::m_sdfClipmap.Load(int4(texel, 0));
+        if (sdf < 0.75f)
+        {
+            return 1.0f; // near a surface -> shadowed
+        }
+        pos += dir * max(sdf * cell * 0.57735f, cell);
+    }
+    return 0.0f;
+}
+
+float3 SampleIrradiance(float3 worldPos, float3 normal)
+{
+    int c = WDGI_SelectCascade(worldPos);
+    if (c < 0)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    int3 physical = WDGI_PhysicalCell(WDGI_WorldCell(worldPos, c));
+    float3 faceColors[WDGLOBALGI_FACE_COUNT];
+    [unroll] for (int f = 0; f < WDGLOBALGI_FACE_COUNT; ++f)
+    {
+        faceColors[f] = PassSrg::m_irradianceClipmap.Load(int4(WDGI_IrradianceTexel(physical, c, f), 0)).rgb;
+    }
+    return WDGI_EvalAmbientCube(faceColors, normal);
+}
+
+[numthreads(4, 4, 4)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    int3 res = WDGI_GridRes();
+    uint totalZ = (uint)res.z * PassSrg::m_cascadeCount;
+    if (dispatch_id.x >= (uint)res.x || dispatch_id.y >= (uint)res.y || dispatch_id.z >= totalZ)
+    {
+        return;
+    }
+
+    int cascade = (int)(dispatch_id.z / (uint)res.z);
+    int localZ = (int)(dispatch_id.z % (uint)res.z);
+    int3 physical = int3(int2(dispatch_id.xy), localZ);
+    int3 texel = int3(dispatch_id.xyz);
+
+    float4 rad = PassSrg::m_radianceClipmap[texel];
+    if (rad.a < 0.5f)
+    {
+        return; // not an occupied voxel
+    }
+    float4 voxelNormal = PassSrg::m_voxelNormalClipmap.Load(int4(texel, 0));
+    float3 n = voxelNormal.rgb * 2.0f - 1.0f;
+    float nLen = length(n);
+    if (voxelNormal.a < 0.5f || nLen < 0.1f)
+    {
+        return; // no/ambiguous normal -> keep the injected value
+    }
+    float3 normal = n / nLen;
+    float3 albedo = PassSrg::m_albedoClipmap.Load(int4(texel, 0)).rgb;
+
+    int3 liveCell = WDGI_LiveWorldCell(physical, cascade);
+    float cell = WDGI_CascadeCellSize(cascade);
+    float3 worldPos = (float3(liveCell) + 0.5f) * cell;
+
+    // Direct sun with an SDF-traced voxel shadow. The direction is the config sun by default, but when
+    // auto-sun is on we follow the brightest GI-affecting scene directional light (its colour/intensity
+    // stay config-driven - scene lights are in lux, a different scale than the injection path).
+    float3 sunDir = PassSrg::m_sunDirectionIntensity.xyz; // toward the surface
+    if (PassSrg::m_autoSun != 0 && PassSrg::m_sceneDirLightCount > 0)
+    {
+        float bestLum = -1.0f;
+        [loop] for (uint li = 0; li < PassSrg::m_sceneDirLightCount; ++li)
+        {
+            WDGI_DirLight L = PassSrg::m_directionalLights[li];
+            // Pick the brightest directional light (the sun). We deliberately do NOT require the light's
+            // "affects GI" flag - the intent is only to track the sun's direction, so the relight follows
+            // the scene sun even if that checkbox is off. m_direction points toward the surface (matches
+            // our convention); guard against a zero-length direction.
+            float lum = dot(L.m_rgbIntensityLux, float3(0.2126f, 0.7152f, 0.0722f));
+            if (lum > bestLum && dot(L.m_direction, L.m_direction) > 1e-6f)
+            {
+                bestLum = lum;
+                sunDir = normalize(L.m_direction);
+            }
+        }
+    }
+    float ndotl = saturate(dot(normal, -sunDir));
+    float lit = 0.0f;
+    if (ndotl > 0.0f)
+    {
+        lit = 1.0f - TraceShadow(worldPos + normal * (cell * 2.0f), -sunDir);
+    }
+    float3 directIrradiance = PassSrg::m_sunColor.rgb * PassSrg::m_sunDirectionIntensity.w * ndotl * lit;
+
+    float3 indirectIrradiance = SampleIrradiance(worldPos, normal);
+
+    // L_out = albedo * (direct + indirect) (cosine-weighted convention, no extra /PI).
+    float3 litColor = albedo * (directIrradiance + indirectIrradiance);
+
+    PassSrg::m_radianceClipmap[texel] = float4(lerp(litColor, rad.rgb, PassSrg::m_sceneBlend), rad.a);
+}

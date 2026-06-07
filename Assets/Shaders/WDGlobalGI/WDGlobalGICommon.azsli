@@ -1,0 +1,231 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Shared helpers for the WDGlobalGI (Dagor GI) solution: clipmap addressing, the HL2 Ambient Cube
+ * basis, ray-direction sampling and a tiny RNG. Only constant members of PassSrg are referenced here
+ * (every GI shader declares the same constant block), so these helpers are texture-access agnostic.
+ */
+
+#pragma once
+
+#include <WDGlobalGISharedConstants.azsli>
+
+static const float WDGI_PI = 3.14159265359f;
+static const float WDGI_TWO_PI = 6.28318530718f;
+
+// Screen-space probe layout (must match WDGlobalGILimits in WDGlobalGIConfiguration.h).
+#define WDGI_SP_TILE 16    // screen pixels per probe tile
+#define WDGI_SP_OCTA 8     // octahedral radiance resolution per probe (WDGI_SP_OCTA x WDGI_SP_OCTA)
+#define WDGI_SP_COEFFS 9   // order-2 irradiance SH coefficients per probe
+
+// ---------------------------------------------------------------------------------------------
+// Octahedral mapping (unit direction <-> [0,1]^2). Equal-area-ish, used for the screen-probe
+// radiance maps (this is the octahedral encoding that daGI2 uses on its screen probes).
+// ---------------------------------------------------------------------------------------------
+
+float2 WDGI_OctaEncode(float3 dir)
+{
+    dir /= (abs(dir.x) + abs(dir.y) + abs(dir.z));
+    float2 oct = dir.xy;
+    if (dir.z < 0.0f)
+    {
+        oct = (1.0f - abs(dir.yx)) * float2(dir.x >= 0.0f ? 1.0f : -1.0f, dir.y >= 0.0f ? 1.0f : -1.0f);
+    }
+    return oct * 0.5f + 0.5f;
+}
+
+float3 WDGI_OctaDecode(float2 uv)
+{
+    float2 f = uv * 2.0f - 1.0f;
+    float3 n = float3(f.x, f.y, 1.0f - abs(f.x) - abs(f.y));
+    float t = saturate(-n.z);
+    n.x += (n.x >= 0.0f) ? -t : t;
+    n.y += (n.y >= 0.0f) ? -t : t;
+    return normalize(n);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Order-2 spherical harmonics (9 coefficients). Used to compress each screen probe's octahedral
+// radiance into a smooth, cheap-to-interpolate per-probe irradiance.
+// ---------------------------------------------------------------------------------------------
+
+//! Evaluate the 9 real SH basis functions for a unit direction.
+void WDGI_SHBasis(float3 d, out float Y[9])
+{
+    Y[0] = 0.282095f;
+    Y[1] = 0.488603f * d.y;
+    Y[2] = 0.488603f * d.z;
+    Y[3] = 0.488603f * d.x;
+    Y[4] = 1.092548f * d.x * d.y;
+    Y[5] = 1.092548f * d.y * d.z;
+    Y[6] = 0.315392f * (3.0f * d.z * d.z - 1.0f);
+    Y[7] = 1.092548f * d.x * d.z;
+    Y[8] = 0.546274f * (d.x * d.x - d.y * d.y);
+}
+
+//! Cosine-lobe convolution factor per SH band (l=0,1,2) - turns a radiance SH into an irradiance SH.
+float WDGI_SHCosineBand(int index)
+{
+    if (index == 0) return 3.14159265f;      // A0 = PI
+    if (index < 4)  return 2.0943951f;        // A1 = 2*PI/3
+    return 0.7853982f;                        // A2 = PI/4
+}
+
+//! Evaluate irradiance E(n) from 9 RGB irradiance-SH coefficients (already cosine-convolved).
+float3 WDGI_SHEvalIrradiance(float3 coeffs[9], float3 n)
+{
+    float Y[9];
+    WDGI_SHBasis(n, Y);
+    float3 e = float3(0.0f, 0.0f, 0.0f);
+    [unroll] for (int i = 0; i < 9; ++i)
+    {
+        e += coeffs[i] * Y[i];
+    }
+    return max(e, float3(0.0f, 0.0f, 0.0f));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Clipmap addressing
+// ---------------------------------------------------------------------------------------------
+
+int3 WDGI_GridRes()
+{
+    return int3(PassSrg::m_gridResolution);
+}
+
+float WDGI_CascadeCellSize(int c)
+{
+    return PassSrg::m_cascadeCenterAndCell[c].w;
+}
+
+int3 WDGI_CascadeCenterCell(int c)
+{
+    return int3(round(PassSrg::m_cascadeCenterAndCell[c].xyz));
+}
+
+//! World position -> integer cell index inside cascade c.
+int3 WDGI_WorldCell(float3 worldPos, int c)
+{
+    return int3(floor(worldPos / WDGI_CascadeCellSize(c)));
+}
+
+//! Select the finest cascade whose window contains worldPos. Returns -1 if outside all cascades.
+int WDGI_SelectCascade(float3 worldPos)
+{
+    int3 halfRes = WDGI_GridRes() / 2;
+    for (uint c = 0; c < PassSrg::m_cascadeCount; ++c)
+    {
+        int3 cell = WDGI_WorldCell(worldPos, (int)c);
+        int3 d = abs(cell - WDGI_CascadeCenterCell((int)c));
+        if (d.x < halfRes.x && d.y < halfRes.y && d.z < halfRes.z)
+        {
+            return (int)c;
+        }
+    }
+    return -1;
+}
+
+//! Toroidal physical texel for a world cell (grid resolution is power-of-two).
+int3 WDGI_PhysicalCell(int3 worldCell)
+{
+    int3 mask = WDGI_GridRes() - 1;
+    return worldCell & mask;
+}
+
+//! Recover the unique "live" world cell that a physical texel maps to within cascade c.
+int3 WDGI_LiveWorldCell(int3 physical, int c)
+{
+    int3 mask = WDGI_GridRes() - 1;
+    int3 originCell = WDGI_CascadeCenterCell(c) - WDGI_GridRes() / 2;
+    return originCell + ((physical - originCell) & mask);
+}
+
+//! Texel into the radiance clipmap (cascades stacked along Z).
+int3 WDGI_RadianceTexel(int3 physical, int c)
+{
+    return int3(physical.x, physical.y, c * WDGI_GridRes().z + physical.z);
+}
+
+//! Texel into the irradiance clipmap (cascade*face slabs stacked along Z).
+int3 WDGI_IrradianceTexel(int3 physical, int c, int face)
+{
+    return int3(physical.x, physical.y, (c * WDGLOBALGI_FACE_COUNT + face) * WDGI_GridRes().z + physical.z);
+}
+
+// ---------------------------------------------------------------------------------------------
+// HL2 Ambient Cube
+// ---------------------------------------------------------------------------------------------
+
+//! Face directions, order: +X, -X, +Y, -Y, +Z, -Z. Uses conditionals (rather than a dynamically
+//! indexed local array) so it compiles cleanly even when called with a non-constant face index.
+float3 WDGI_AmbientCubeDir(int face)
+{
+    if (face == 0) return float3( 1.0f,  0.0f,  0.0f);
+    if (face == 1) return float3(-1.0f,  0.0f,  0.0f);
+    if (face == 2) return float3( 0.0f,  1.0f,  0.0f);
+    if (face == 3) return float3( 0.0f, -1.0f,  0.0f);
+    if (face == 4) return float3( 0.0f,  0.0f,  1.0f);
+    return float3( 0.0f,  0.0f, -1.0f);
+}
+
+//! Evaluate the ambient cube for a normal, sampling 3 of the 6 faces based on the normal's sign.
+float3 WDGI_EvalAmbientCube(float3 faceColors[WDGLOBALGI_FACE_COUNT], float3 n)
+{
+    float3 nSq = n * n;
+    float3 cX = (n.x >= 0.0f) ? faceColors[0] : faceColors[1];
+    float3 cY = (n.y >= 0.0f) ? faceColors[2] : faceColors[3];
+    float3 cZ = (n.z >= 0.0f) ? faceColors[4] : faceColors[5];
+    return nSq.x * cX + nSq.y * cY + nSq.z * cZ;
+}
+
+// ---------------------------------------------------------------------------------------------
+// RNG + ray sampling
+// ---------------------------------------------------------------------------------------------
+
+uint WDGI_Hash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float WDGI_RandFromUint(uint x)
+{
+    return (WDGI_Hash(x) & 0x00ffffffu) / 16777216.0f;
+}
+
+//! Fibonacci-sphere direction i of n, jittered by a per-probe seed to decorrelate frames.
+float3 WDGI_SphereDir(uint i, uint n, uint seed)
+{
+    float jitter = WDGI_RandFromUint(seed);
+    float t = (float(i) + jitter) / float(max(n, 1u));
+    float phi = WDGI_TWO_PI * frac(float(i) * 0.61803398875f + WDGI_RandFromUint(seed + 7u));
+    float cosTheta = 1.0f - 2.0f * t;
+    float sinTheta = sqrt(saturate(1.0f - cosTheta * cosTheta));
+    return float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+//! Cheap analytic sky used when a ray escapes the voxel cascades.
+float3 WDGI_Sky(float3 dir)
+{
+    float up = saturate(dir.z * 0.5f + 0.5f);
+    float3 sky = PassSrg::m_skyColorIntensity.rgb * PassSrg::m_skyColorIntensity.a;
+    return sky * lerp(0.35f, 1.0f, up);
+}
+
+//! Reconstruct world-space position from a non-linear depth sample using the clip->world matrix
+//! constant (self-contained: avoids a ViewSrg binding that the raw compute passes do not provide).
+float3 WDGI_ReconstructWorldPos(float2 uv, float depth)
+{
+    float x = uv.x * 2.0f - 1.0f;
+    float y = (1.0f - uv.y) * 2.0f - 1.0f;
+    float4 clipPos = float4(x, y, depth, 1.0f);
+    float4 worldPos = mul(PassSrg::m_clipToWorld, clipPos);
+    return worldPos.xyz / worldPos.w;
+}
