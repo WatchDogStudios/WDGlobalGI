@@ -29,7 +29,8 @@
     "repo_uri": "",
     "version": "1.0.0",
     "compatible_engines": [
-        "o3de>=2.0.0"
+        "o3de>=2.0.0",
+        "o3de-sdk>=2.6.0"
     ],
     "engine_api_dependencies": [
         "Atom"
