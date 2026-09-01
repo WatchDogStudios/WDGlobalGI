@@ -1,0 +1,80 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Persistent world-space surfel cache (lean EA-style surfel GI layer). Surfels are spawned from the
+ * G-buffer where the screen lacks coverage, accumulate ray-traced irradiance at fixed world positions
+ * (so their signal is temporally rock-stable), and are gathered per pixel through a camera-following
+ * uniform grid rebuilt every frame.
+ *
+ * Storage (all 2D textures, following the gem's atlas conventions):
+ *  - data atlas (RGBA32F, WDGI_SURFEL_DATA_STRIDE texels per surfel):
+ *      [0] xyz = world position, w = radius (0 = dead / free slot)
+ *      [1] xyz = surface normal,  w = last-seen frame index
+ *      [2] rgb = accumulated irradiance E, a = sample count (convergence)
+ *  - grid (R32_UINT): per cell [count, up to 7 surfel indices]. Surfels insert into every cell their
+ *    radius overlaps, so a gather only ever reads the shading point's own cell.
+ *
+ * Helpers here are addressing-only (PassSrg constants at most), so any GI shader can include this
+ * after WDGlobalGICommon.azsli.
+ */
+
+#pragma once
+
+#define WDGI_SURFEL_CAPACITY    65536
+#define WDGI_SURFEL_DATA_STRIDE 3
+#define WDGI_SURFEL_GRID_X      64
+#define WDGI_SURFEL_GRID_Y      64
+#define WDGI_SURFEL_GRID_Z      32
+#define WDGI_SURFEL_GRID_SLOTS  8   // slot 0 = count, 1..7 = surfel indices
+
+int2 WDGI_SurfelDataTexel(uint surfel, uint component)
+{
+    return int2((surfel & 1023u) * WDGI_SURFEL_DATA_STRIDE + component, surfel >> 10u);
+}
+
+//! World size of one surfel-grid cell (2 finest clipmap cells; also the spawned surfel radius).
+float WDGI_SurfelGridCellSize()
+{
+    return PassSrg::m_cascadeCenterAndCell[0].w * 2.0f;
+}
+
+//! World-space origin of the grid window, snapped to whole grid cells so cell ownership is stable
+//! while the camera moves (the grid itself is transient - rebuilt from surfel positions every frame).
+float3 WDGI_SurfelGridOrigin()
+{
+    float g = WDGI_SurfelGridCellSize();
+    float3 centerWorld = PassSrg::m_cascadeCenterAndCell[0].xyz * PassSrg::m_cascadeCenterAndCell[0].w;
+    float3 halfExtent = float3(WDGI_SURFEL_GRID_X, WDGI_SURFEL_GRID_Y, WDGI_SURFEL_GRID_Z) * (0.5f * g);
+    return floor((centerWorld - halfExtent) / g) * g;
+}
+
+//! Grid cell containing a world position; false when outside the cache window.
+bool WDGI_SurfelGridCell(float3 worldPos, out int3 cell)
+{
+    float3 rel = (worldPos - WDGI_SurfelGridOrigin()) / WDGI_SurfelGridCellSize();
+    cell = int3(floor(rel));
+    return all(cell >= int3(0, 0, 0)) &&
+        all(cell < int3(WDGI_SURFEL_GRID_X, WDGI_SURFEL_GRID_Y, WDGI_SURFEL_GRID_Z));
+}
+
+uint WDGI_SurfelCellIndex(int3 cell)
+{
+    return (uint)((cell.z * WDGI_SURFEL_GRID_Y + cell.y) * WDGI_SURFEL_GRID_X + cell.x);
+}
+
+int2 WDGI_SurfelGridTexel(uint cellIndex, uint slot)
+{
+    uint t = cellIndex * WDGI_SURFEL_GRID_SLOTS + slot;
+    return int2(t & 1023u, t >> 10u);
+}
+
+//! Gather weight of a surfel for a shading point: quadratic distance falloff x normal agreement.
+float WDGI_SurfelWeight(float3 worldPos, float3 normal, float4 posRadius, float3 surfelNormal)
+{
+    float d = distance(worldPos, posRadius.xyz);
+    float w = saturate(1.0f - d / max(posRadius.w, 1e-3f));
+    return w * w * saturate(dot(normal, surfelNormal));
+}

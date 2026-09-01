@@ -55,6 +55,11 @@ void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
     float cell = WDGI_CascadeCellSize(cascade);
     float3 origin = (float3(liveCell) + 0.5f) * cell;
 
+    // Nudge the probe out of solid geometry before tracing. A centre that lands inside a wall or
+    // under a floor traces every ray from solid space and integrates permanent darkness, which no
+    // amount of hysteresis recovers from. Costs one SDF sample for probes already in open space.
+    origin = WDGI_RelocateProbe(origin, liveCell, cascade, cell);
+
     uint probeIndex = (uint)physical.x +
                       (uint)physical.y * (uint)res.x +
                       actualZ * (uint)(res.x * res.y);

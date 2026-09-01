@@ -1,0 +1,12 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "WDGlobalGISurfelGridBuildPassTemplate",
+            "PassClass": "WDGlobalGISurfelGridBuildPass",
+            "Slots": []
+        }
+    }
+}

@@ -39,4 +39,5 @@
     uint   m_anisotropic;            /* 1 = sample 6-direction anisotropic voxel radiance (#4) */       \
     uint   m_useRadianceCache;       /* 1 = escaped/long rays reuse the cached world irradiance (#8) */  \
     row_major float4x4 m_prevWorldToClip; /* last frame's view-proj, for screen-probe reprojection */    \
+    row_major float4x4 m_worldToClip;     /* current view-proj (anchor depth for history validation) */  \
     float  m_cascadeBlend;           /* 0 = hard cascade boundaries, 1 = blend across them (anti-seam) */

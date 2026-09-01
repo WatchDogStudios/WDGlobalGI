@@ -73,6 +73,9 @@ namespace AZ
                 uint32_t m_useRadianceCache = 0;  // 1 = escaped/long rays reuse cached world irradiance (#8)
                 // Last frame's world->clip (row-major) for screen-probe motion reprojection (#2).
                 float m_prevWorldToClip[16] = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f };
+                // Current world->clip (row-major): the trace stores each probe's anchor view depth with
+                // it, which next frame's reprojection validates against (same matrix, one frame apart).
+                float m_worldToClip[16] = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f };
                 float m_cascadeBlend = 1.0f; // 0 = hard cascade boundaries, 1 = blend across them
             };
 
@@ -82,7 +85,7 @@ namespace AZ
             //! Release the clipmap textures.
             void Release();
 
-            bool IsInitialized() const { return m_radianceClipmap && m_irradianceClipmap && m_sdfClipmap && m_voxelNormalClipmap && m_albedoClipmap && m_screenProbeAtlas && m_screenProbeSH && m_anisoRadianceClipmap && m_screenProbeAtlasHistory && m_volumetricFroxel && m_screenProbeDepthAtlas && m_screenProbeSHBlurred; }
+            bool IsInitialized() const { return m_radianceClipmap && m_irradianceClipmap && m_sdfClipmap && m_voxelNormalClipmap && m_albedoClipmap && m_screenProbeAtlas && m_screenProbeSH && m_anisoRadianceClipmap && m_screenProbeAtlasHistory && m_volumetricFroxel && m_screenProbeDepthAtlas && m_screenProbeSHBlurred && m_surfelData && m_surfelGrid && m_surfelAlloc; }
 
             //! Recompute the per-cascade centres from the current camera position and refresh the
             //! shader constants from the configuration.
@@ -137,6 +140,13 @@ namespace AZ
             //! View-aligned froxel volume holding accumulated in-scattered GI for volumetric fog (#7).
             const Data::Instance<RPI::AttachmentImage>& GetVolumetricFroxel() const { return m_volumetricFroxel; }
 
+            //! Surfel GI: persistent surfel data atlas (RGBA32F, 3 texels/surfel: pos+radius,
+            //! normal+lastSeen, irradiance+count), the transient per-frame cell grid (R32_UINT), and
+            //! the 1x1 ring allocation cursor. See WDGlobalGISurfels.azsli for the layout contract.
+            const Data::Instance<RPI::AttachmentImage>& GetSurfelData() const { return m_surfelData; }
+            const Data::Instance<RPI::AttachmentImage>& GetSurfelGrid() const { return m_surfelGrid; }
+            const Data::Instance<RPI::AttachmentImage>& GetSurfelAlloc() const { return m_surfelAlloc; }
+
             //! Screen-probe atlas ping-pong (audit #2 reprojection): each frame the trace writes the
             //! "current" atlas and reads the "previous" one (reprojected by camera motion); convert /
             //! integrate read the just-written "current". Roles swap by frame parity.
@@ -166,6 +176,8 @@ namespace AZ
             static RHI::ImageViewDescriptor GetScreenProbeShViewDescriptor();
             static RHI::ImageViewDescriptor GetAnisoRadianceViewDescriptor();
             static RHI::ImageViewDescriptor GetVolumetricFroxelViewDescriptor();
+            static RHI::ImageViewDescriptor GetSurfelDataViewDescriptor();
+            static RHI::ImageViewDescriptor GetSurfelGridViewDescriptor();
 
             static uint32_t GetRadianceDepth()
             {
@@ -202,6 +214,9 @@ namespace AZ
             Data::Instance<RPI::AttachmentImage> m_volumetricFroxel;         // view-aligned froxel GI (#7)
             Data::Instance<RPI::AttachmentImage> m_screenProbeDepthAtlas;    // octahedral depth moments (Chebyshev)
             Data::Instance<RPI::AttachmentImage> m_screenProbeSHBlurred;     // depth-aware spatial denoise of the SH
+            Data::Instance<RPI::AttachmentImage> m_surfelData;               // surfel GI: persistent surfel storage
+            Data::Instance<RPI::AttachmentImage> m_surfelGrid;               // surfel GI: per-frame cell buckets
+            Data::Instance<RPI::AttachmentImage> m_surfelAlloc;              // surfel GI: ring allocation cursor
 
             ShaderConstants m_constants;
             bool m_invalidated = true;
@@ -213,6 +228,9 @@ namespace AZ
             // "typed UAV load additional formats" capability. Memory is trivial (~1.6 MB).
             static constexpr RHI::Format SdfFormat = RHI::Format::R32_FLOAT;
             static constexpr RHI::Format VoxelNormalFormat = RHI::Format::R8G8B8A8_UNORM;
+            // Full-precision surfel storage (world positions), and R32_UINT for the grid's atomics.
+            static constexpr RHI::Format SurfelDataFormat = RHI::Format::R32G32B32A32_FLOAT;
+            static constexpr RHI::Format SurfelGridFormat = RHI::Format::R32_UINT;
         };
     } // namespace Render
 } // namespace AZ

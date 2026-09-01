@@ -75,6 +75,16 @@ namespace AZ
             static constexpr uint32_t VolumetricFroxelX = 160;
             static constexpr uint32_t VolumetricFroxelY = 90;
             static constexpr uint32_t VolumetricFroxelZ = 64;
+
+            // World-space surfel cache (lean surfel GI). Data atlas: 3 RGBA32F texels per surfel
+            // (pos+radius / normal+lastSeen / irradiance+count), 1024 surfels per row. Grid: a
+            // camera-following 64x64x32-cell window, 8 uint slots per cell (count + 7 indices) =
+            // exactly 1024x1024 R32_UINT. Must match the WDGI_SURFEL_* defines in WDGlobalGISurfels.azsli.
+            static constexpr uint32_t SurfelCapacity = 65536;
+            static constexpr uint32_t SurfelDataStride = 3;
+            static constexpr uint32_t SurfelDataAtlasWidth = 1024 * SurfelDataStride;
+            static constexpr uint32_t SurfelDataAtlasHeight = SurfelCapacity / 1024;
+            static constexpr uint32_t SurfelGridTexSize = 1024;
         }
 
         //! Runtime-tweakable settings for the global illumination solution.
@@ -105,7 +115,8 @@ namespace AZ
             //! Maximum number of voxel ray-march steps before falling back to sky.
             uint32_t m_maxRaySteps = 64;
 
-            //! Fraction of probes refreshed each frame (stochastic update budget, 0..1).
+            //! Fraction of screen probes that trace fresh rays each frame (round-robin per tile; the
+            //! rest carry validated reprojected history forward). The main screen-probe cost dial.
             float m_probeUpdateFraction = 0.25f;
 
             //! Use the screen-space probe detail layer (octahedral, per-pixel) instead of compositing
@@ -113,11 +124,24 @@ namespace AZ
             //! fallback); screen probes replace the final composite. Off by default (experimental).
             bool m_useScreenProbes = false;
 
+            //! Phase 9: trace the screen-probe rays against the real ray-tracing TLAS
+            //! (RayTracingSceneSrg::m_scene) instead of sphere-tracing the SDF/voxel clipmap. Sees real,
+            //! unvoxelized geometry - no voxel-resolution cap - at the cost of requiring hardware ray
+            //! tracing support and an RT-capable scene. Only takes effect when m_useScreenProbes is also
+            //! on; this repoints the screen-probe trace, it does not add a new layer. Off by default: the
+            //! SDF path is what every scene already relies on, and hardware RT is not universally
+            //! available. WDGlobalGIFeatureProcessor::SetConfiguration() clamps this back to false if the
+            //! device reports no ray tracing support, so GI falls back to the SDF path instead of the
+            //! screen-probe atlas silently going dark.
+            bool m_useHardwareRT = false;
+
             //! Temporal blend weight for the screen-probe radiance atlas (toward history).
             float m_screenProbeTemporal = 0.9f;
 
             //! Glossy specular strength from the screen-probe octahedral radiance (0 = diffuse only).
-            float m_screenProbeSpecular = 0.4f;
+            //! The radiance is scaled by the SpecularF0 G-buffer's per-pixel F0/roughness environment
+            //! BRDF, so 1 is the physically-based default (it used to be an unscaled 0.4 flat gain).
+            float m_screenProbeSpecular = 1.0f;
 
             //! Light-leak reduction (audit #4): attenuate voxel hits whose stored surface normal faces
             //! away from the ray. 0 = off (isotropic), 1 = full directional occlusion of back-faces.
@@ -157,17 +181,47 @@ namespace AZ
             //! irradiance clipmap as a far-field / extra-bounce term instead of flat sky. Off by default.
             bool m_useRadianceCache = false;
 
-            //! Glossy-reflection cone width for the screen-probe specular term (0 = sharp mirror,
-            //! 1 = very blurry). Widens the octahedral gather. Only used when screen probes are on.
-            float m_specularRoughness = 0.4f;
+            //! Global scale on the per-pixel G-buffer roughness that drives the glossy-reflection cone
+            //! width (0 = force sharp mirrors, 1 = trust the material roughness). Screen probes only.
+            float m_specularRoughness = 1.0f;
 
             //! Spatial denoise of the screen-probe irradiance SH: a depth-aware 3x3 blur across probes
             //! before integration (0 = off/passthrough, 1 = full blur). The main screen-probe noise fix.
             float m_screenProbeBlur = 1.0f;
 
+            // --- Screen-probe denoiser gap closes: pre-filter, variance-adaptive blend, luminance clamp ---
+            // These sit in the trace shaders, upstream of the existing temporal/SH/blur/upscale chain.
+            // Each float knob is 0 = off; the luminance clamp has its own bool gate. All only take effect
+            // once m_useScreenProbes is already on (default false), matching this feature's opt-in convention.
+
+            //! Firefly clamp applied per-probe, before the temporal blend: any octahedral sample brighter
+            //! than (this * the probe's own 8x8 mean luminance) is scaled back down to that ceiling, so a
+            //! single bright ray can't survive into the history atlas and smear. 0 = off.
+            float m_screenProbeFireflyClamp = 4.0f;
+
+            //! Adaptive temporal weight: an EWMA of each atlas texel's frame-to-frame luminance delta
+            //! (persisted in the otherwise-unused .b channel of the depth-moments atlas) scales the
+            //! configured Screen Probe Temporal weight down as that texel gets noisier, so converged
+            //! probes stay near the full history weight (stop being re-blurred) while noisy ones fall
+            //! toward the raw sample (accumulate/converge faster). 0 = off (constant weight, old behaviour).
+            float m_screenProbeVarianceScale = 8.0f;
+
+            //! Clamp the post-blend screen-probe radiance to m_screenProbeMaxLuminance, same scheme as
+            //! ReflectionScreenSpaceFilter.azsl's SSR luminance clamp (scale the sample down by
+            //! maxLuminance/luminance rather than hard-clipping per channel).
+            bool m_screenProbeLuminanceClamp = true;
+            float m_screenProbeMaxLuminance = 8.0f;
+
             //! Cascade-blend strength: fade the voxel radiance between adjacent clipmap cascades near
             //! their boundaries to hide the "cascade lines" seam (0 = hard boundaries, 1 = full blend).
             float m_cascadeBlend = 1.0f;
+
+            //! Surfel GI: maintain a persistent world-space surfel cache (spawned from the G-buffer,
+            //! irradiance accumulated at fixed world positions) and let it override the screen-probe SH
+            //! diffuse where it has coverage. World-anchored accumulation makes the indirect diffuse
+            //! temporally rock-stable near the camera; screen probes remain the fallback elsewhere.
+            //! Needs m_useScreenProbes. Off by default.
+            bool m_useSurfels = false;
 
             //! Audit #7: volumetric / media GI. Samples the GI into a view-aligned froxel volume for
             //! in-scattered fog light, composited additively into the scene. Off by default.

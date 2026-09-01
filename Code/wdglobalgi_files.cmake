@@ -38,6 +38,16 @@ set(FILES
     Source/Render/Passes/WDGlobalGIApplyPass.h
     Source/Render/Passes/WDGlobalGIScreenProbeTracePass.cpp
     Source/Render/Passes/WDGlobalGIScreenProbeTracePass.h
+    Source/Render/Passes/WDGlobalGIScreenProbeTraceRTPass.cpp
+    Source/Render/Passes/WDGlobalGIScreenProbeTraceRTPass.h
+    Source/Render/Passes/WDGlobalGISurfelGridResetPass.cpp
+    Source/Render/Passes/WDGlobalGISurfelGridResetPass.h
+    Source/Render/Passes/WDGlobalGISurfelGridBuildPass.cpp
+    Source/Render/Passes/WDGlobalGISurfelGridBuildPass.h
+    Source/Render/Passes/WDGlobalGISurfelSpawnPass.cpp
+    Source/Render/Passes/WDGlobalGISurfelSpawnPass.h
+    Source/Render/Passes/WDGlobalGISurfelUpdatePass.cpp
+    Source/Render/Passes/WDGlobalGISurfelUpdatePass.h
     Source/Render/Passes/WDGlobalGIScreenProbeConvertPass.cpp
     Source/Render/Passes/WDGlobalGIScreenProbeConvertPass.h
     Source/Render/Passes/WDGlobalGIScreenProbeBlurPass.cpp

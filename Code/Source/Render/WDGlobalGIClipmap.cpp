@@ -66,6 +66,16 @@ namespace AZ
             return RHI::ImageViewDescriptor::Create3D(ClipmapFormat, 0, 0, 0, static_cast<uint16_t>(WDGlobalGILimits::VolumetricFroxelZ - 1));
         }
 
+        RHI::ImageViewDescriptor WDGlobalGIClipmap::GetSurfelDataViewDescriptor()
+        {
+            return RHI::ImageViewDescriptor::Create(SurfelDataFormat, 0, 0);
+        }
+
+        RHI::ImageViewDescriptor WDGlobalGIClipmap::GetSurfelGridViewDescriptor()
+        {
+            return RHI::ImageViewDescriptor::Create(SurfelGridFormat, 0, 0);
+        }
+
         Data::Instance<RPI::AttachmentImage> WDGlobalGIClipmap::CreateAtlasImage(uint32_t width, uint32_t height, RHI::Format format, const char* name)
         {
             RHI::ImageDescriptor imageDesc = RHI::ImageDescriptor::Create2D(
@@ -154,6 +164,15 @@ namespace AZ
                 WDGlobalGILimits::VolumetricFroxelX, WDGlobalGILimits::VolumetricFroxelY, WDGlobalGILimits::VolumetricFroxelZ,
                 ClipmapFormat, "WDGlobalGI_VolumetricFroxel");
 
+            // Surfel GI cache. The data atlas relies on zero-initialisation: radius 0 = free slot.
+            m_surfelData = CreateAtlasImage(
+                WDGlobalGILimits::SurfelDataAtlasWidth, WDGlobalGILimits::SurfelDataAtlasHeight,
+                SurfelDataFormat, "WDGlobalGI_SurfelData");
+            m_surfelGrid = CreateAtlasImage(
+                WDGlobalGILimits::SurfelGridTexSize, WDGlobalGILimits::SurfelGridTexSize,
+                SurfelGridFormat, "WDGlobalGI_SurfelGrid");
+            m_surfelAlloc = CreateAtlasImage(1, 1, SurfelGridFormat, "WDGlobalGI_SurfelAlloc");
+
             m_invalidated = true;
         }
 
@@ -171,6 +190,9 @@ namespace AZ
             m_volumetricFroxel = nullptr;
             m_screenProbeDepthAtlas = nullptr;
             m_screenProbeSHBlurred = nullptr;
+            m_surfelData = nullptr;
+            m_surfelGrid = nullptr;
+            m_surfelAlloc = nullptr;
         }
 
         bool WDGlobalGIClipmap::ConsumeInvalidated()
@@ -204,6 +226,7 @@ namespace AZ
             // for next frame. On the first frame the previous matrix is identity (reprojection just misses).
             m_lastWorldToClip.StoreToRowMajorFloat16(m_constants.m_prevWorldToClip);
             m_lastWorldToClip = worldToClip;
+            worldToClip.StoreToRowMajorFloat16(m_constants.m_worldToClip);
 
             // Snap each cascade centre to its own cell grid so the toroidal addressing stays stable as the
             // camera moves (the texture only "scrolls" by whole cells).
@@ -327,6 +350,7 @@ namespace AZ
             setRaw("m_anisotropic", &m_constants.m_anisotropic, sizeof(m_constants.m_anisotropic));
             setRaw("m_useRadianceCache", &m_constants.m_useRadianceCache, sizeof(m_constants.m_useRadianceCache));
             setRaw("m_prevWorldToClip", m_constants.m_prevWorldToClip, sizeof(m_constants.m_prevWorldToClip));
+            setRaw("m_worldToClip", m_constants.m_worldToClip, sizeof(m_constants.m_worldToClip));
             setRaw("m_cascadeBlend", &m_constants.m_cascadeBlend, sizeof(m_constants.m_cascadeBlend));
         }
     } // namespace Render

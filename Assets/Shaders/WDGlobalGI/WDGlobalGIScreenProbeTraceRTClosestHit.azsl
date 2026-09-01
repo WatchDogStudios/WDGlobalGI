@@ -1,0 +1,94 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Phase 9 hit shading: albedo + emissive come from the bindless fallback-PBR material (the same
+ * MaterialInfoUtil.azsli / FallbackPBRMaterial machinery Reflections' ray traced specular already uses -
+ * see ReflectionScreenSpaceRayTracingClosestHit.azsli), lit by the GI's own config-driven sun (shadowed
+ * by a second TLAS visibility trace, replacing the SDF voxel-shadow march the compute path uses) plus a
+ * flat sky ambient term (WDGI_Sky(), same convention as the SDF path's escaped-ray sky).
+ *
+ * ponytail: sun + flat sky only, no scene point/spot/area lights and no specular lobe - this hit shader
+ * feeds a per-pixel DIFFUSE probe layer, and WDGlobalGIRelight.azsl already established config-sun-only
+ * as this gem's lighting-environment ceiling (see its own comment). Upgrade path: pull in
+ * RayTracingSceneSrg's light lists and ApplyDirectLighting()-style loop (ReflectionScreenSpaceRayTracing
+ * Common.azsli) the day per-pixel GI needs to see point lights the voxel injection doesn't already carry.
+ */
+
+// SpecularAA.azsli's `option bool o_applySpecularAA` needs an SRG carrying ShaderVariantFallback; our
+// PassSrg is plain SRG_PerPass (no fallback), and ddx_fine/ddy_fine aren't valid in ray tracing shaders
+// anyway - same reasoning as ReflectionScreenSpaceRayTracingClosestHit.azsli, which disables it for the
+// same include chain (MaterialUtils.azsli -> SpecularAA.azsli).
+#define ENABLE_SPECULARAA 0
+
+#include "WDGlobalGIScreenProbeTraceRTCommon.azsli"
+#include <Atom/Features/FallbackPBRMaterial/MaterialInfoUtil.azsli>
+#include <Atom/Features/PBR/MaterialUtils.azsli> // GetAlbedo()
+
+[shader("closesthit")]
+void ClosestHit(inout WDGiRtPayload payload, BuiltInTriangleIntersectionAttributes attrib)
+{
+    payload.m_hitT = RayTCurrent();
+
+    MeshInfo meshInfo;
+    MaterialInfo materialInfo;
+    if (!GetMeshInfoEntry(InstanceID(), meshInfo) || !GetMaterialInfoEntry(InstanceID(), materialInfo))
+    {
+        payload.m_radiance = float3(0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    VsInput vertex = GetHitInterpolatedVertexData(meshInfo, PrimitiveIndex(), attrib.barycentrics);
+    float3 positionWS = mul(ObjectToWorld3x4(), float4(vertex.position, 1.0f));
+
+    // Widen the ray cone the raygen seeded, turn its footprint at the hit into a texture mip - same
+    // pattern as ReflectionScreenSpaceRayTracingClosestHit.azsl.
+    float3 geometricNormalWS;
+    float triangleLodConstant = GetHitTriangleLodConstant(meshInfo, PrimitiveIndex(), geometricNormalWS);
+    RayCone hitCone = PropagateRayCone(UnpackRayCone(payload.m_packedRayCone), RayTCurrent());
+    float mipLevel = ComputeRayConeTextureLod(
+        hitCone, triangleLodConstant, WorldRayDirection(), geometricNormalWS,
+        GetFallbackPBRMaterialBaseColorDimensions(materialInfo));
+    TextureData textureData = GetFallbackPBRMaterialTextureData(materialInfo, RayTracingSceneSrg::LinearSampler, vertex.uv0, mipLevel);
+
+    // ponytail: interpolated vertex normal only, no normal-map sample (unlike the specular ClosestHit
+    // this mirrors) - a diffuse GI probe doesn't need per-texel normal detail. Upgrade path: sample
+    // materialInfo.m_normalImage and build a TBN the way ScreenSpaceClosestHitImpl() does, if the extra
+    // texture fetch is worth it for GI someday.
+    float3 normalWS = normalize(mul(WorldToObject3x4(), float4(vertex.normal, 0.0f)).xyz);
+    if (dot(normalWS, -WorldRayDirection()) < 0.0f)
+    {
+        normalWS = -normalWS; // two-sided: face the incoming ray
+    }
+
+    float3 albedo = GetAlbedo(textureData.m_baseColor.rgb, textureData.m_metallic);
+
+    float3 dirToSun = -normalize(PassSrg::m_sunDirectionIntensity.xyz);
+    float NdotL = saturate(dot(normalWS, dirToSun));
+    float3 direct = float3(0.0f, 0.0f, 0.0f);
+    if (NdotL > 0.0f)
+    {
+        // Shadow ray toward the sun, replacing the SDF-march voxel shadow the compute path uses. Skips
+        // ClosestHit so a hit leaves the payload at its zero-initialised default and only the Miss shader
+        // (below) marks visibility - same trick as Reflections' CheckLightVisibility().
+        RayDesc shadowRay;
+        shadowRay.Origin = positionWS + normalWS * 0.01f;
+        shadowRay.Direction = dirToSun;
+        shadowRay.TMin = 0.0f;
+        shadowRay.TMax = RayTracingGlobalSrg::m_maxRayLength;
+
+        WDGiRtPayload shadowPayload = (WDGiRtPayload)0;
+        TraceRay(RayTracingSceneSrg::m_scene, RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, 0xFF, 0, 1, 0, shadowRay, shadowPayload);
+
+        if (shadowPayload.m_hitT < 0.0f) // miss shader ran -> sun visible
+        {
+            direct = albedo * PassSrg::m_sunColor.rgb * PassSrg::m_sunDirectionIntensity.w * NdotL;
+        }
+    }
+
+    float3 ambient = albedo * WDGI_Sky(normalWS);
+
+    payload.m_radiance = direct + ambient + textureData.m_emissiveColor;
+}

@@ -1,0 +1,72 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Shared payload + SRG for the Phase 9 hardware-RT screen-probe trace pipeline
+ * (WDGlobalGIScreenProbeTraceRT / ...ClosestHit / ...Miss). Included identically by all three stages -
+ * see the comment in Atom's PathTracingCommon.azsli for why every ray tracing pipeline in this tree does
+ * that (SRG_RayTracingGlobal / RayCones.azsli have a fixed FrequencyId and layout owned by Reflections;
+ * SRG_PerPass is free, so our own resources - the octahedral atlas, its history, and the shared GI
+ * constants - go there instead, same as this file's non-RT sibling, WDGlobalGICommon.azsli).
+ *
+ * This is the RT counterpart of WDGlobalGIScreenProbeTrace.azsl: same octahedral atlas, same temporal
+ * reprojection scheme, same WDGLOBALGI_SHARED_CONSTANTS block. The only structural difference is what
+ * answers "what does this probe ray see" - the SDF/voxel clipmap there, RayTracingSceneSrg::m_scene (the
+ * real TLAS) here - so this file intentionally does NOT touch WDGlobalGIScreenProbeTrace.azsl or
+ * WDGlobalGITrace.azsli; it is a parallel, alongside implementation, not a modification of the SDF one.
+ */
+
+#pragma once
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+// Forces RayTracingGlobalSrg (SRG_RayTracingGlobal) + RayTracingSceneSrg (SRG_RayTracingScene) + ViewSrg +
+// SceneSrg + Bindless into scope - required by every stage of a ray tracing pipeline in this tree, even
+// though this pass never reads RayTracingGlobalSrg's own (Reflections-owned) fields.
+#include <Atom/Features/RayTracing/RayCones.azsli>
+#include <Atom/Features/RayTracing/Sampling.azsli>
+#include <Atom/Features/RayTracing/RayTracingSceneUtils.azsli> // VsInput, GetMeshInfoEntry, GetHitInterpolatedVertexData
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float>  m_depth;              // G-buffer depth (probe placement)
+    RWTexture2D<float4> m_screenProbeAtlas;   // octahedral radiance (rgb), a = probe anchor view depth (0 = sky/invalid)
+    Texture2D<float4>   m_screenProbeHistory; // previous-frame atlas for motion reprojection
+    RWTexture2D<float4> m_screenProbeDepthAtlas; // octahedral hit-distance moments (rg = mean, mean^2)
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+    float m_screenProbeTemporal;
+
+    // Same denoiser gap-closes as the SDF path (WDGlobalGIScreenProbeTrace.azsl) - variance-adaptive
+    // blend + post-blend clamp, via the shared WDGI_ScreenProbeVariance/WDGI_ClampLuminance helpers.
+    // ponytail: no groupshared firefly pre-filter here - raygen/closest-hit/miss shaders have no thread-
+    // group-shared memory to reduce a probe's octahedral neighbourhood over, unlike the SDF path's
+    // numthreads(8,8,1) compute kernel. Add one if RT-path fireflies turn out to need it (e.g. a small
+    // separate compute pass over the atlas before the temporal blend).
+    float m_screenProbeVarianceScale;  // 0 = off (constant m_screenProbeTemporal weight)
+    bool  m_screenProbeLuminanceClamp;
+    float m_screenProbeMaxLuminance;
+}
+
+// Reuses WDGI_OctaEncode/Decode, WDGI_Sky, WDGI_ReconstructWorldPos, WDGI_SP_TILE/OCTA and the RNG - all
+// texture-access-agnostic, PassSrg-constants-only helpers - unchanged from the SDF path. WDGI_SP_TRACE
+// additionally unlocks the shared trace scheduling + validated history reprojection (m_screenProbeHistory
+// is declared in the SRG above).
+#define WDGI_SP_TRACE
+#include <WDGlobalGICommon.azsli>
+
+//! Carries the hit radiance (or sky, on a miss) back to the raygen, plus enough state for the shadow
+//! visibility sub-trace and the ray-cone texture LOD. m_hitT < 0 means "miss" (set by the Miss shader);
+//! the shadow-visibility trace relies on the zero-initialised default surviving a RAY_FLAG_SKIP_CLOSEST_
+//! HIT_SHADER hit, exactly like Reflections' CheckLightVisibility() in ReflectionScreenSpaceRayTracingCommon.azsli.
+struct WDGiRtPayload
+{
+    float3 m_radiance;
+    float  m_hitT;
+    uint   m_packedRayCone;
+};

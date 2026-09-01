@@ -229,3 +229,142 @@ float3 WDGI_ReconstructWorldPos(float2 uv, float depth)
     float4 worldPos = mul(PassSrg::m_clipToWorld, clipPos);
     return worldPos.xyz / worldPos.w;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Screen-probe temporal denoiser helpers, shared by the SDF trace (WDGlobalGIScreenProbeTrace.azsl)
+// and the hardware-RT trace (WDGlobalGIScreenProbeTraceRT.azsl) - both write the same octahedral
+// atlas and depth-moments atlas via the same per-texel temporal blend, so the adaptive-weight and
+// clamp math lives here once instead of forking. This is deliberately just two small functions, not
+// a pass/library refactor of the denoiser chain itself (SH resolve / spatial blur / bilateral
+// upscale stay exactly where they are).
+// ---------------------------------------------------------------------------------------------
+
+//! Rec.709 luminance (same weights as Atom's PostProcessUtil.azsli GetLuminance - duplicated here,
+//! not included, so the GI compute shaders stay self-contained like WDGI_ReconstructWorldPos above).
+float WDGI_Luminance(float3 color)
+{
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+//! Variance-adaptive temporal weight for one screen-probe atlas texel. prevVariance is an EWMA of
+//! this texel's frame-to-frame luminance delta, persisted by the caller (the otherwise-unused .b
+//! channel of the depth-moments atlas); curLum/histLum are this frame's raw sample and the
+//! reprojected history sample. Returns the new variance estimate (store it back) and, via
+//! outBlendWeight, baseTemporal scaled down as the texel gets noisier - 1 at zero variance (converged,
+//! stays at the configured weight) falling toward 0 as variance grows (trust the new sample more, so
+//! the estimate moves/converges faster instead of re-blurring stale noise). varianceScale <= 0 disables
+//! the adaptation (outBlendWeight = baseTemporal, old constant-weight behaviour).
+float WDGI_ScreenProbeVariance(float prevVariance, float curLum, float histLum, float baseTemporal, float varianceScale, out float outBlendWeight)
+{
+    float delta = curLum - histLum;
+    float newVariance = lerp(prevVariance, delta * delta, 0.25f);
+    if (varianceScale <= 0.0f)
+    {
+        outBlendWeight = baseTemporal;
+    }
+    else
+    {
+        outBlendWeight = baseTemporal / (1.0f + newVariance * varianceScale);
+    }
+    return newVariance;
+}
+
+//! Post-blend luminance clamp, identical scheme to ReflectionScreenSpaceFilter.azsl's SSR clamp: scale
+//! the whole sample down by maxLuminance/luminance rather than hard-clipping per channel.
+float3 WDGI_ClampLuminance(float3 color, bool enabled, float maxLuminance)
+{
+    if (!enabled)
+    {
+        return color;
+    }
+    float luminance = WDGI_Luminance(color);
+    if (luminance > maxLuminance && luminance > 1e-5f)
+    {
+        color *= (maxLuminance / luminance);
+    }
+    return color;
+}
+
+#ifdef WDGI_SP_TRACE
+// ---------------------------------------------------------------------------------------------
+// Screen-probe trace scheduling + history reprojection. These reference
+// PassSrg::m_screenProbeHistory, which only the two trace shaders declare - they define
+// WDGI_SP_TRACE before including this file (same opt-in pattern as WDGI_TRACE_USE_CACHE).
+// ---------------------------------------------------------------------------------------------
+
+//! Round-robin probe scheduling: how many frames apart each screen probe re-traces its rays, from the
+//! configured update fraction (1 = every frame ... 16 = every 16th frame).
+uint WDGI_ScreenProbeTraceInterval()
+{
+    return (uint)clamp(round(1.0f / max(PassSrg::m_probeUpdateFraction, 0.0625f)), 1.0f, 16.0f);
+}
+
+//! True when this probe tile is scheduled for a fresh trace this frame. The per-tile hash offsets the
+//! schedule so the traced subset is spatially decorrelated instead of a marching scanline.
+bool WDGI_ScreenProbeTraceSelected(uint2 tile)
+{
+    uint interval = WDGI_ScreenProbeTraceInterval();
+    return ((WDGI_Hash(tile.x | (tile.y << 16u)) + PassSrg::m_frameIndex) % interval) == 0u;
+}
+
+//! View depth of a world position under the CURRENT view-projection. The trace stores it in the atlas
+//! .a as the probe's anchor depth; next frame's reprojection measures the same surface with what is by
+//! then m_prevWorldToClip - the same matrix - and rejects history whose anchor disagrees.
+float WDGI_AnchorViewDepth(float3 worldPos)
+{
+    return mul(PassSrg::m_worldToClip, float4(worldPos, 1.0f)).w;
+}
+
+//! Reproject this probe's surface into last frame's atlas: bilinear over the 4 surrounding history
+//! probes at the same octahedral texel, each validated against the anchor view depth it stored in .a.
+//! The old nearest-tile unvalidated read snapped between tiles as the camera moved (shimmer) and
+//! happily consumed history from a different surface after a silhouette-edge flip (ghosting); the
+//! validated bilinear does neither. Returns rgb history + validity in .a (0 = no usable history).
+float4 WDGI_ReprojectScreenProbeHistory(float3 worldPos, uint2 octa, uint2 screenRes, uint2 tiles)
+{
+    float4 prevClip = mul(PassSrg::m_prevWorldToClip, float4(worldPos, 1.0f));
+    if (prevClip.w <= 1e-4f)
+    {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    float2 prevNdc = prevClip.xy / prevClip.w;
+    float2 prevUv = float2(prevNdc.x * 0.5f + 0.5f, 0.5f - prevNdc.y * 0.5f);
+    if (any(prevUv < float2(0.0f, 0.0f)) || any(prevUv > float2(1.0f, 1.0f)))
+    {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    // Probe-grid coordinate (probe centres at integer tile indices, same convention as the integrate).
+    float2 prevProbeCoord = prevUv * float2(screenRes) / float(WDGI_SP_TILE) - 0.5f;
+    int2 baseTile = int2(floor(prevProbeCoord));
+    float2 f = prevProbeCoord - float2(baseTile);
+
+    // Snap near-integer coordinates to the exact probe: a (nearly) static camera then reads its own
+    // texel verbatim instead of re-applying a ~3% bilinear mix of the neighbours every frame, which
+    // would slowly diffuse the atlas across probes on the round-robin copy path.
+    f.x = (abs(f.x - round(f.x)) < 0.05f) ? round(f.x) : f.x;
+    f.y = (abs(f.y - round(f.y)) < 0.05f) ? round(f.y) : f.y;
+
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float wSum = 0.0f;
+    [unroll] for (int j = 0; j < 2; ++j)
+    {
+        [unroll] for (int i = 0; i < 2; ++i)
+        {
+            int2 t = clamp(baseTile + int2(i, j), int2(0, 0), int2(tiles) - int2(1, 1));
+            float w = (i == 0 ? 1.0f - f.x : f.x) * (j == 0 ? 1.0f - f.y : f.y);
+            float4 h = PassSrg::m_screenProbeHistory.Load(int3(t * int(WDGI_SP_OCTA) + int2(octa), 0));
+            if (h.a > 0.0f && abs(h.a - prevClip.w) < 0.1f * prevClip.w)
+            {
+                sum += h.rgb * w;
+                wSum += w;
+            }
+        }
+    }
+    if (wSum <= 1e-3f)
+    {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    return float4(sum / wSum, 1.0f);
+}
+#endif // WDGI_SP_TRACE

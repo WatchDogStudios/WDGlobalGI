@@ -61,6 +61,9 @@ namespace AZ
 
             //! Whether the screen-space probe layer is active (replaces the clipmap composite).
             bool GetUseScreenProbes() const { return m_configuration.m_useScreenProbes; }
+            //! Phase 9: screen probes trace the real TLAS instead of sphere-tracing the SDF/voxel clipmap.
+            //! Always false if the device has no ray tracing support (see SetConfiguration()).
+            bool GetUseHardwareRT() const { return m_configuration.m_useHardwareRT; }
             float GetScreenProbeTemporal() const { return m_configuration.m_screenProbeTemporal; }
             float GetScreenProbeSpecular() const { return m_configuration.m_screenProbeSpecular; }
             bool GetUseRelight() const { return m_configuration.m_useRelight; }
@@ -68,6 +71,9 @@ namespace AZ
 
             //! Volumetric / media GI (#7) is active (gates the volumetric + composite passes).
             bool GetUseVolumetric() const { return m_configuration.m_useVolumetric; }
+
+            //! Surfel GI layer is active (gates the surfel passes and the integrate's surfel gather).
+            bool GetUseSurfels() const { return m_configuration.m_useSurfels; }
 
             //! True for the first frame after an invalidation (cold start): the SceneInject pass should
             //! seed the voxels with direct light only before the irradiance loop runs.

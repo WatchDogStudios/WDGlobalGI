@@ -25,8 +25,28 @@
                 "Path": "Passes/WDGlobalGIPropagate.pass"
             },
             {
+                "Name": "WDGlobalGISurfelGridResetPassTemplate",
+                "Path": "Passes/WDGlobalGISurfelGridReset.pass"
+            },
+            {
+                "Name": "WDGlobalGISurfelGridBuildPassTemplate",
+                "Path": "Passes/WDGlobalGISurfelGridBuild.pass"
+            },
+            {
+                "Name": "WDGlobalGISurfelSpawnPassTemplate",
+                "Path": "Passes/WDGlobalGISurfelSpawn.pass"
+            },
+            {
+                "Name": "WDGlobalGISurfelUpdatePassTemplate",
+                "Path": "Passes/WDGlobalGISurfelUpdate.pass"
+            },
+            {
                 "Name": "WDGlobalGIScreenProbeTracePassTemplate",
                 "Path": "Passes/WDGlobalGIScreenProbeTrace.pass"
+            },
+            {
+                "Name": "WDGlobalGIScreenProbeTraceRTPassTemplate",
+                "Path": "Passes/WDGlobalGIScreenProbeTraceRT.pass"
             },
             {
                 "Name": "WDGlobalGIScreenProbeConvertPassTemplate",

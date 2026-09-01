@@ -97,6 +97,83 @@ float WDGI_CascadeBlendWeight(float3 worldPos, int c)
 // big jumps. Stepping by sdf*cell/sqrt(3) is a conservative lower bound on the Euclidean distance, so a
 // step never overshoots a surface; the one-cell minimum preserves near-surface accuracy. Returns the
 // first opaque radiance hit, the cached far-field, or the sky.
+// ---------------------------------------------------------------------------------------------
+// Probe relocation.
+//
+// A world probe sits at the centre of its clipmap cell. When that centre lands inside geometry --
+// inside a wall, under a floor, within a thick prop -- every ray it casts starts in solid space, so
+// the probe integrates near-black or garbage irradiance and never recovers, because the error is
+// geometric rather than temporal. It shows up as dark blotches or leaks that no amount of
+// hysteresis fixes.
+//
+// DDGI implementations solve this by counting backface hits over many frames and iteratively
+// nudging the probe. We do not need to: the SDF clipmap already stores signed distance-to-surface
+// in cells, so the correct offset is available analytically in one step -- walk up the SDF gradient
+// until the probe has clearance.
+//
+// Set WDGLOBALGI_PROBE_RELOCATION to 0 to disable and restore centre-pinned probes.
+#ifndef WDGLOBALGI_PROBE_RELOCATION
+#define WDGLOBALGI_PROBE_RELOCATION 1
+#endif
+
+// Clearance we want between a probe and the nearest surface, in cells.
+#define WDGLOBALGI_PROBE_CLEARANCE_CELLS  0.75f
+
+// Hard cap on how far a probe may move, in cells. Kept below 0.5 deliberately: consumers sample
+// irradiance by world position -> cell and assume the probe is at the cell centre. Clamping under
+// half a cell keeps the probe inside its own cell, so that assumption stays approximately true and
+// the residual error is far smaller than the artefact being fixed.
+#define WDGLOBALGI_PROBE_MAX_OFFSET_CELLS 0.45f
+
+//! Signed distance to the nearest surface, in cells, at a given live world cell of cascade c.
+float WDGI_SdfAtWorldCell(int3 worldCell, int c)
+{
+    int3 phys = WDGI_PhysicalCell(worldCell);
+    return PassSrg::m_sdfClipmap.Load(int4(WDGI_RadianceTexel(phys, c), 0));
+}
+
+//! Offset a probe out of solid geometry along the SDF gradient.
+//! @param origin    probe centre in world space
+//! @param liveCell  the probe's live world cell (from WDGI_LiveWorldCell)
+//! @param c         cascade index
+//! @param cellSize  world size of one cell in this cascade
+float3 WDGI_RelocateProbe(float3 origin, int3 liveCell, int c, float cellSize)
+{
+#if WDGLOBALGI_PROBE_RELOCATION
+    float d = WDGI_SdfAtWorldCell(liveCell, c);
+    if (d >= WDGLOBALGI_PROBE_CLEARANCE_CELLS)
+    {
+        return origin; // already in open space - the common case, one sample and out
+    }
+
+    // Central differences over the 6 neighbours. Neighbours are computed in world-cell space and
+    // mapped through WDGI_PhysicalCell individually, so the clipmap's toroidal wrap is respected.
+    float dxp = WDGI_SdfAtWorldCell(liveCell + int3(1, 0, 0), c);
+    float dxn = WDGI_SdfAtWorldCell(liveCell - int3(1, 0, 0), c);
+    float dyp = WDGI_SdfAtWorldCell(liveCell + int3(0, 1, 0), c);
+    float dyn = WDGI_SdfAtWorldCell(liveCell - int3(0, 1, 0), c);
+    float dzp = WDGI_SdfAtWorldCell(liveCell + int3(0, 0, 1), c);
+    float dzn = WDGI_SdfAtWorldCell(liveCell - int3(0, 0, 1), c);
+
+    float3 gradient = float3(dxp - dxn, dyp - dyn, dzp - dzn);
+    float  gradLen  = length(gradient);
+
+    // A flat gradient means the SDF has no opinion about which way is out -- deep inside a solid
+    // block, or an uninitialised region. Moving on a normalised zero vector would fling the probe
+    // somewhere arbitrary, so leave it where it is and let the next SDF update decide.
+    if (gradLen < 1e-5f)
+    {
+        return origin;
+    }
+
+    float pushCells = min(WDGLOBALGI_PROBE_CLEARANCE_CELLS - d, WDGLOBALGI_PROBE_MAX_OFFSET_CELLS);
+    return origin + (gradient / gradLen) * (pushCells * cellSize);
+#else
+    return origin;
+#endif
+}
+// ---------------------------------------------------------------------------------------------
+
 float3 WDGI_TraceVoxelRay(float3 origin, float3 dir, out float hitDistance)
 {
     float3 pos = origin;

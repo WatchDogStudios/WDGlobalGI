@@ -18,6 +18,11 @@
                     "ScopeAttachmentUsage": "Shader"
                 },
                 {
+                    "Name": "SpecularF0Input",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader"
+                },
+                {
                     "Name": "DepthStencilInputOutput",
                     "SlotType": "InputOutput",
                     "ScopeAttachmentUsage": "DepthStencil"
@@ -56,8 +61,35 @@
                     "TemplateName": "WDGlobalGIPropagatePassTemplate"
                 },
                 {
+                    "Name": "WDGlobalGISurfelGridResetPass",
+                    "TemplateName": "WDGlobalGISurfelGridResetPassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGISurfelGridBuildPass",
+                    "TemplateName": "WDGlobalGISurfelGridBuildPassTemplate"
+                },
+                {
+                    "Name": "WDGlobalGISurfelSpawnPass",
+                    "TemplateName": "WDGlobalGISurfelSpawnPassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "Normal", "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGISurfelUpdatePass",
+                    "TemplateName": "WDGlobalGISurfelUpdatePassTemplate"
+                },
+                {
                     "Name": "WDGlobalGIScreenProbeTracePass",
                     "TemplateName": "WDGlobalGIScreenProbeTracePassTemplate",
+                    "Connections": [
+                        { "LocalSlot": "Depth", "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } }
+                    ]
+                },
+                {
+                    "Name": "WDGlobalGIScreenProbeTraceRTPass",
+                    "TemplateName": "WDGlobalGIScreenProbeTraceRTPassTemplate",
                     "Connections": [
                         { "LocalSlot": "Depth", "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } }
                     ]
@@ -93,6 +125,7 @@
                         { "LocalSlot": "AlbedoInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "AlbedoInput" } },
                         { "LocalSlot": "NormalInput", "AttachmentRef": { "Pass": "Parent", "Attachment": "NormalInput" } },
                         { "LocalSlot": "DepthInput",  "AttachmentRef": { "Pass": "Parent", "Attachment": "DepthStencilInputOutput" } },
+                        { "LocalSlot": "SpecularF0Input", "AttachmentRef": { "Pass": "Parent", "Attachment": "SpecularF0Input" } },
                         { "LocalSlot": "DiffuseInputOutput", "AttachmentRef": { "Pass": "Parent", "Attachment": "DiffuseInputOutput" } }
                     ]
                 },

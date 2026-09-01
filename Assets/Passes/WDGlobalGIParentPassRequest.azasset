@@ -16,6 +16,10 @@
                 "AttachmentRef": { "Pass": "Forward", "Attachment": "NormalOutput" }
             },
             {
+                "LocalSlot": "SpecularF0Input",
+                "AttachmentRef": { "Pass": "Forward", "Attachment": "SpecularF0Output" }
+            },
+            {
                 "LocalSlot": "DepthStencilInputOutput",
                 "AttachmentRef": { "Pass": "Forward", "Attachment": "DepthStencilInputOutput" }
             },

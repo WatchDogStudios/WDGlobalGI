@@ -1,0 +1,106 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Surfel GI: screen-driven spawning. One thread per screen tile samples a per-frame-jittered G-buffer
+ * pixel; if no live surfel already covers that surface point, a new surfel is allocated there from the
+ * ring cursor. Covering surfels get their last-seen frame refreshed, which is what keeps on-screen
+ * surfels alive (WDGlobalGISurfelUpdate.azsl retires the rest).
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <Atom/RPI/Math.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2DMS<float>  m_depth;
+    Texture2DMS<float4> m_normal;
+    RWTexture2D<float4> m_surfelData;
+    Texture2D<uint>     m_surfelGrid;
+    RWTexture2D<uint>   m_surfelAlloc;  // 1x1 ring allocation cursor
+
+    WDGLOBALGI_SHARED_CONSTANTS
+
+    uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
+}
+
+#include <WDGlobalGICommon.azsli>
+#include <WDGlobalGISurfels.azsli>
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint2 tile = dispatch_id.xy;
+    if (tile.x >= PassSrg::m_screenProbeInfo.z || tile.y >= PassSrg::m_screenProbeInfo.w)
+    {
+        return;
+    }
+    uint2 screenRes = PassSrg::m_screenProbeInfo.xy;
+
+    // Jitter the sampled pixel within the tile each frame so spawning sweeps the whole surface.
+    uint seed = WDGI_Hash((tile.y << 16u | tile.x) ^ WDGI_Hash(PassSrg::m_frameIndex));
+    uint2 jitter = uint2(seed & (WDGI_SP_TILE - 1u), (seed >> 4u) & (WDGI_SP_TILE - 1u));
+    uint2 pixel = min(tile * WDGI_SP_TILE + jitter, screenRes - uint2(1, 1));
+
+    float depth = PassSrg::m_depth.Load(int2(pixel), 0).r;
+    if (depth <= 0.0f)
+    {
+        return;
+    }
+    float2 uv = (float2(pixel) + 0.5f) / float2(screenRes);
+    float3 worldPos = WDGI_ReconstructWorldPos(uv, depth);
+    float3 normal = DecodeNormalSignedOctahedron(PassSrg::m_normal.Load(int2(pixel), 0).rgb);
+
+    int3 cell;
+    if (!WDGI_SurfelGridCell(worldPos, cell))
+    {
+        return; // outside the cache window - the screen-probe SH keeps covering it
+    }
+
+    // Coverage test against the surfels bucketed into this cell; refresh last-seen on the covering
+    // ones (every writer stores the same frame value, so the cross-tile race is benign).
+    uint cellIndex = WDGI_SurfelCellIndex(cell);
+    uint count = min(PassSrg::m_surfelGrid.Load(int3(WDGI_SurfelGridTexel(cellIndex, 0), 0)),
+        uint(WDGI_SURFEL_GRID_SLOTS - 1));
+    float coverage = 0.0f;
+    [loop] for (uint s = 0; s < count; ++s)
+    {
+        uint idx = PassSrg::m_surfelGrid.Load(int3(WDGI_SurfelGridTexel(cellIndex, s + 1u), 0));
+        float4 posRadius = PassSrg::m_surfelData[WDGI_SurfelDataTexel(idx, 0)];
+        float4 nrm = PassSrg::m_surfelData[WDGI_SurfelDataTexel(idx, 1)];
+        float w = WDGI_SurfelWeight(worldPos, normal, posRadius, nrm.xyz);
+        coverage += w;
+        if (w > 0.0f)
+        {
+            PassSrg::m_surfelData[WDGI_SurfelDataTexel(idx, 1)] = float4(nrm.xyz, (float)PassSrg::m_frameIndex);
+        }
+    }
+    if (coverage >= 0.5f)
+    {
+        return;
+    }
+
+    // Allocate from the ring cursor: fresh slots first; once the pool has wrapped, only steal slots
+    // that are dead or long-unseen. The cursor advances regardless, so a fully live pool simply stops
+    // spawning instead of thrashing its own working set.
+    uint cursor;
+    InterlockedAdd(PassSrg::m_surfelAlloc[int2(0, 0)], 1u, cursor);
+    uint surfel = cursor % WDGI_SURFEL_CAPACITY;
+    if (cursor >= WDGI_SURFEL_CAPACITY)
+    {
+        float radius = PassSrg::m_surfelData[WDGI_SurfelDataTexel(surfel, 0)].w;
+        float lastSeen = PassSrg::m_surfelData[WDGI_SurfelDataTexel(surfel, 1)].w;
+        if (radius > 0.0f && float(PassSrg::m_frameIndex) - lastSeen < 120.0f)
+        {
+            return; // still live and recently on screen - don't steal it
+        }
+    }
+
+    PassSrg::m_surfelData[WDGI_SurfelDataTexel(surfel, 0)] =
+        float4(worldPos + normal * 0.02f, WDGI_SurfelGridCellSize());
+    PassSrg::m_surfelData[WDGI_SurfelDataTexel(surfel, 1)] = float4(normal, (float)PassSrg::m_frameIndex);
+    PassSrg::m_surfelData[WDGI_SurfelDataTexel(surfel, 2)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+}

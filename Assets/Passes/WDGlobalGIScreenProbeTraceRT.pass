@@ -1,0 +1,33 @@
+{
+    "Type": "JsonSerialization",
+    "Version": 1,
+    "ClassName": "PassAsset",
+    "ClassData": {
+        "PassTemplate": {
+            "Name": "WDGlobalGIScreenProbeTraceRTPassTemplate",
+            "PassClass": "WDGlobalGIScreenProbeTraceRTPass",
+            "Slots": [
+                {
+                    "Name": "Depth",
+                    "SlotType": "Input",
+                    "ScopeAttachmentUsage": "Shader",
+                    "ImageViewDesc": {
+                        "AspectFlags": [ "Depth" ]
+                    }
+                }
+            ],
+            "PassData": {
+                "$type": "RayTracingPassData",
+                "RayGenerationShaderAsset": { "FilePath": "Shaders/WDGlobalGI/WDGlobalGIScreenProbeTraceRT.shader" },
+                "RayGenerationShaderName": "RayGeneration",
+                "ClosestHitShaderAsset": { "FilePath": "Shaders/WDGlobalGI/WDGlobalGIScreenProbeTraceRTClosestHit.shader" },
+                "ClosestHitShaderName": "ClosestHit",
+                "MissShaderAsset": { "FilePath": "Shaders/WDGlobalGI/WDGlobalGIScreenProbeTraceRTMiss.shader" },
+                "MissShaderName": "Miss",
+                "MaxPayloadSize": 32,
+                "MaxRecursionDepth": 2,
+                "MaxRayLength": 500.0
+            }
+        }
+    }
+}

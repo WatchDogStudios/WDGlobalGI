@@ -1,0 +1,71 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Surfel GI: bucket every live surfel into the camera-following uniform grid. A surfel inserts into
+ * every cell its radius overlaps (radius <= one grid cell, so at most 3 cells per axis), which lets
+ * the per-pixel gather read only the shading point's own cell.
+ */
+
+#include <Atom/Features/SrgSemantics.azsli>
+#include <WDGlobalGISharedConstants.azsli>
+
+ShaderResourceGroup PassSrg : SRG_PerPass
+{
+    Texture2D<float4> m_surfelData;
+    RWTexture2D<uint> m_surfelGrid;
+
+    WDGLOBALGI_SHARED_CONSTANTS
+}
+
+#include <WDGlobalGICommon.azsli>
+#include <WDGlobalGISurfels.azsli>
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 dispatch_id : SV_DispatchThreadID)
+{
+    uint surfel = dispatch_id.x;
+    if (surfel >= WDGI_SURFEL_CAPACITY)
+    {
+        return;
+    }
+    float4 posRadius = PassSrg::m_surfelData.Load(int3(WDGI_SurfelDataTexel(surfel, 0), 0));
+    if (posRadius.w <= 0.0f)
+    {
+        return;
+    }
+
+    // Radius is one grid cell at spawn; clamp defensively so a stale surfel from an older, larger
+    // Base Cell Size can never blow the 3x3x3 insert bound (the update pass retires those anyway).
+    float g = WDGI_SurfelGridCellSize();
+    float r = min(posRadius.w, g);
+    float3 origin = WDGI_SurfelGridOrigin();
+    int3 gridMax = int3(WDGI_SURFEL_GRID_X, WDGI_SURFEL_GRID_Y, WDGI_SURFEL_GRID_Z) - int3(1, 1, 1);
+    int3 cellMin = int3(floor((posRadius.xyz - r - origin) / g));
+    int3 cellMax = int3(floor((posRadius.xyz + r - origin) / g));
+    if (any(cellMax < int3(0, 0, 0)) || any(cellMin > gridMax))
+    {
+        return; // entirely outside the cache window
+    }
+    cellMin = clamp(cellMin, int3(0, 0, 0), gridMax);
+    cellMax = clamp(cellMax, int3(0, 0, 0), gridMax);
+
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    {
+        for (int y = cellMin.y; y <= cellMax.y; ++y)
+        {
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                uint cellIndex = WDGI_SurfelCellIndex(int3(x, y, z));
+                uint prevCount;
+                InterlockedAdd(PassSrg::m_surfelGrid[WDGI_SurfelGridTexel(cellIndex, 0)], 1u, prevCount);
+                if (prevCount < WDGI_SURFEL_GRID_SLOTS - 1)
+                {
+                    PassSrg::m_surfelGrid[WDGI_SurfelGridTexel(cellIndex, prevCount + 1u)] = surfel;
+                }
+            }
+        }
+    }
+}

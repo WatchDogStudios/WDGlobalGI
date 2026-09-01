@@ -1,0 +1,101 @@
+/*
+ * Copyright (c) Contributors to the Open 3D Engine Project.
+ * For complete copyright and license terms please see the LICENSE at the root of this distribution.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Phase 9: hardware-RT screen-probe trace. One thread per probe octahedral atlas texel, same as
+ * WDGlobalGIScreenProbeTrace.azsl's MainCS, but the direction is traced against the real TLAS
+ * (RayTracingSceneSrg::m_scene via ClosestHit/Miss) instead of sphere-traced through the SDF clipmap.
+ */
+
+#include "WDGlobalGIScreenProbeTraceRTCommon.azsli"
+
+[shader("raygeneration")]
+void RayGeneration()
+{
+    uint2 atlasCoord = DispatchRaysIndex().xy;
+    uint tilesX = PassSrg::m_screenProbeInfo.z;
+    uint tilesY = PassSrg::m_screenProbeInfo.w;
+    if (atlasCoord.x >= tilesX * WDGI_SP_OCTA || atlasCoord.y >= tilesY * WDGI_SP_OCTA)
+    {
+        return;
+    }
+
+    uint2 tile = atlasCoord / WDGI_SP_OCTA;
+    uint2 octa = atlasCoord % WDGI_SP_OCTA;
+
+    uint2 screenRes = PassSrg::m_screenProbeInfo.xy;
+    uint2 probePixel = min(tile * WDGI_SP_TILE + (WDGI_SP_TILE / 2), screenRes - uint2(1, 1));
+
+    float depth = PassSrg::m_depth.Load(int2(probePixel), 0).r;
+
+    if (depth <= 0.0f)
+    {
+        // Sky tile: no anchor depth in .a, so it can never validate as history for a real surface.
+        PassSrg::m_screenProbeAtlas[atlasCoord] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        PassSrg::m_screenProbeDepthAtlas[atlasCoord] = float4(200.0f, 40000.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    float2 uv = (float2(probePixel) + 0.5f) / float2(screenRes);
+    float3 worldPos = WDGI_ReconstructWorldPos(uv, depth);
+    float anchorDepth = WDGI_AnchorViewDepth(worldPos);
+
+    // Motion reprojection: validated bilinear read of last frame's atlas, identical to the SDF path -
+    // see WDGI_ReprojectScreenProbeHistory in WDGlobalGICommon.azsli.
+    float4 history = WDGI_ReprojectScreenProbeHistory(worldPos, octa, screenRes, uint2(tilesX, tilesY));
+
+    // Round-robin ray budget, identical to the SDF path: only m_probeUpdateFraction of the probes cast
+    // fresh rays each frame; the rest carry their reprojected history forward. No usable history
+    // (newly revealed / failed validation) forces a trace.
+    if (!WDGI_ScreenProbeTraceSelected(tile) && history.a > 0.0f)
+    {
+        PassSrg::m_screenProbeAtlas[atlasCoord] = float4(history.rgb, anchorDepth);
+        return;
+    }
+
+    // Cranley-Patterson jitter of the octa sub-texel direction (Sampling.azsli), decorrelated per
+    // atlas texel and frame. A fixed 8x8 octahedral direction set never improves; jittering it and
+    // leaning on the existing temporal blend below turns this into a slowly-converging estimate
+    // instead, at zero extra ray cost.
+    uint seed = GetRandomSeed(atlasCoord, PassSrg::m_frameIndex, 0);
+    float2 jitter = (GetRandomFloat2(seed) - float2(0.5f, 0.5f)) / float(WDGI_SP_OCTA);
+    float3 dir = WDGI_OctaDecode(saturate((float2(octa) + 0.5f) / float(WDGI_SP_OCTA) + jitter));
+
+    RayDesc ray;
+    ray.Origin = worldPos + dir * 0.02f;
+    ray.Direction = dir;
+    ray.TMin = 0.0f;
+    ray.TMax = RayTracingGlobalSrg::m_maxRayLength;
+
+    // Ray cone seeded from the actual screen footprint one probe tile represents (RayCones.azsli),
+    // not DispatchRaysDimensions() - this dispatch runs over the octahedral atlas, not the screen, so
+    // GetCameraPixelSpreadAngle()'s own DispatchRaysDimensions().y read would size the cone from the
+    // wrong resolution.
+    float tanHalfFovY = 1.0f / max(abs(ViewSrg::m_projectionMatrix[1][1]), 1e-6f);
+    RayCone cone = MakeRayCone(0.0f, GetPixelSpreadAngle(tanHalfFovY, screenRes.y));
+
+    WDGiRtPayload payload = (WDGiRtPayload)0;
+    payload.m_packedRayCone = PackRayCone(cone);
+    TraceRay(RayTracingSceneSrg::m_scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+
+    float3 radiance = payload.m_radiance;
+    // Same fp16-atlas clamp convention as the SDF path (WDGlobalGIScreenProbeTrace.azsl): 200 m so the
+    // squared value still fits, 'far'/miss reads as 200 (visible).
+    float storedDist = (payload.m_hitT >= 0.0f) ? min(payload.m_hitT, 200.0f) : 200.0f;
+
+    // Variance-adaptive temporal weight + post-blend luminance clamp - identical scheme to the SDF path
+    // (WDGlobalGIScreenProbeTrace.azsl), see WDGlobalGICommon.azsli. Variance rides in the depth atlas's
+    // unused .b channel, read here before this texel's write below overwrites it.
+    float prevVariance = PassSrg::m_screenProbeDepthAtlas[atlasCoord].b;
+    float blendWeight;
+    float newVariance = WDGI_ScreenProbeVariance(prevVariance, WDGI_Luminance(radiance), WDGI_Luminance(history.rgb),
+        PassSrg::m_screenProbeTemporal, PassSrg::m_screenProbeVarianceScale, blendWeight);
+
+    float hist = (history.a > 0.0f) ? blendWeight : 0.0f;
+    float3 blended = lerp(radiance, history.rgb, hist);
+    blended = WDGI_ClampLuminance(blended, PassSrg::m_screenProbeLuminanceClamp, PassSrg::m_screenProbeMaxLuminance);
+    PassSrg::m_screenProbeAtlas[atlasCoord] = float4(blended, anchorDepth);
+    PassSrg::m_screenProbeDepthAtlas[atlasCoord] = float4(storedDist, storedDist * storedDist, newVariance, 1.0f);
+}

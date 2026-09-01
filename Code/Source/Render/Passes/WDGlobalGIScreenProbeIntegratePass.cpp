@@ -79,6 +79,8 @@ namespace AZ
             importRead(fp->GetClipmap().GetScreenProbeSHBlurred(), WDGlobalGIClipmap::GetScreenProbeShViewDescriptor());
             importRead(fp->GetClipmap().GetScreenProbeAtlasCurrent(frameIndex), WDGlobalGIClipmap::GetScreenProbeAtlasViewDescriptor());
             importRead(fp->GetClipmap().GetScreenProbeDepthAtlas(), WDGlobalGIClipmap::GetScreenProbeAtlasViewDescriptor());
+            importRead(fp->GetClipmap().GetSurfelData(), WDGlobalGIClipmap::GetSurfelDataViewDescriptor());
+            importRead(fp->GetClipmap().GetSurfelGrid(), WDGlobalGIClipmap::GetSurfelGridViewDescriptor());
         }
 
         void WDGlobalGIScreenProbeIntegratePass::CompileResources(const RHI::FrameGraphCompileContext& context)
@@ -107,6 +109,14 @@ namespace AZ
                 setImage("m_screenProbeSH", fp->GetClipmap().GetScreenProbeSHBlurred()); // denoised SH
                 setImage("m_screenProbeAtlas", fp->GetClipmap().GetScreenProbeAtlasCurrent(frameIndex));
                 setImage("m_screenProbeDepthAtlas", fp->GetClipmap().GetScreenProbeDepthAtlas());
+                setImage("m_surfelData", fp->GetClipmap().GetSurfelData());
+                setImage("m_surfelGrid", fp->GetClipmap().GetSurfelGrid());
+
+                const uint32_t useSurfels = fp->GetUseSurfels() ? 1u : 0u;
+                if (RHI::ShaderInputConstantIndex surfelIndex = layout->FindShaderInputConstantIndex(AZ::Name("m_useSurfels")); surfelIndex.IsValid())
+                {
+                    srg->SetConstantRaw(surfelIndex, &useSurfels, sizeof(useSurfels));
+                }
 
                 const float specular = fp->GetScreenProbeSpecular();
                 if (RHI::ShaderInputConstantIndex sIndex = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeSpecular")); sIndex.IsValid())

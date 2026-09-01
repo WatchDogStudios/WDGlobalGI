@@ -28,6 +28,11 @@
 #include <Render/Passes/WDGlobalGIRelightPass.h>
 #include <Render/Passes/WDGlobalGIPropagatePass.h>
 #include <Render/Passes/WDGlobalGIScreenProbeTracePass.h>
+#include <Render/Passes/WDGlobalGIScreenProbeTraceRTPass.h>
+#include <Render/Passes/WDGlobalGISurfelGridResetPass.h>
+#include <Render/Passes/WDGlobalGISurfelGridBuildPass.h>
+#include <Render/Passes/WDGlobalGISurfelSpawnPass.h>
+#include <Render/Passes/WDGlobalGISurfelUpdatePass.h>
 #include <Render/Passes/WDGlobalGIScreenProbeConvertPass.h>
 #include <Render/Passes/WDGlobalGIScreenProbeBlurPass.h>
 #include <Render/Passes/WDGlobalGIApplyPass.h>
@@ -173,6 +178,11 @@ namespace AZ
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIRelightPass"), &WDGlobalGIRelightPass::Create);
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIPropagatePass"), &WDGlobalGIPropagatePass::Create);
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIScreenProbeTracePass"), &WDGlobalGIScreenProbeTracePass::Create);
+            passSystem->AddPassCreator(AZ::Name("WDGlobalGIScreenProbeTraceRTPass"), &WDGlobalGIScreenProbeTraceRTPass::Create);
+            passSystem->AddPassCreator(AZ::Name("WDGlobalGISurfelGridResetPass"), &WDGlobalGISurfelGridResetPass::Create);
+            passSystem->AddPassCreator(AZ::Name("WDGlobalGISurfelGridBuildPass"), &WDGlobalGISurfelGridBuildPass::Create);
+            passSystem->AddPassCreator(AZ::Name("WDGlobalGISurfelSpawnPass"), &WDGlobalGISurfelSpawnPass::Create);
+            passSystem->AddPassCreator(AZ::Name("WDGlobalGISurfelUpdatePass"), &WDGlobalGISurfelUpdatePass::Create);
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIScreenProbeConvertPass"), &WDGlobalGIScreenProbeConvertPass::Create);
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIScreenProbeBlurPass"), &WDGlobalGIScreenProbeBlurPass::Create);
             passSystem->AddPassCreator(AZ::Name("WDGlobalGIApplyPass"), &WDGlobalGIApplyPass::Create);
@@ -270,14 +280,29 @@ namespace AZ
                 ImGui::TextUnformatted("Screen-Space Probes (octahedral, #2/#3)");
                 bool spChanged = false;
                 spChanged |= ImGui::Checkbox("Use Screen Probes (experimental)", &config.m_useScreenProbes);
+                spChanged |= ImGui::Checkbox("Use Hardware Ray Tracing (Phase 9, experimental)", &config.m_useHardwareRT);
                 spChanged |= ImGui::SliderFloat("Probe Temporal", &config.m_screenProbeTemporal, 0.0f, 0.98f);
                 spChanged |= ImGui::SliderFloat("Glossy Specular", &config.m_screenProbeSpecular, 0.0f, 1.0f);
+                spChanged |= ImGui::SliderFloat("Firefly Clamp (pre-filter)", &config.m_screenProbeFireflyClamp, 0.0f, 16.0f);
+                spChanged |= ImGui::SliderFloat("Variance Weight (adaptive blend)", &config.m_screenProbeVarianceScale, 0.0f, 64.0f);
+                spChanged |= ImGui::Checkbox("Luminance Clamp", &config.m_screenProbeLuminanceClamp);
+                spChanged |= ImGui::SliderFloat("Max Luminance", &config.m_screenProbeMaxLuminance, 0.0f, 64.0f);
+                spChanged |= ImGui::SliderFloat("Probe Update Fraction", &config.m_probeUpdateFraction, 0.0625f, 1.0f);
+                spChanged |= ImGui::Checkbox("Surfel GI (world-stable diffuse)", &config.m_useSurfels);
                 if (spChanged)
                 {
                     fp->SetConfiguration(config);
                 }
                 ImGui::TextWrapped("Replaces the coarse clipmap composite with per-pixel octahedral screen probes "
                                    "(traced against the same voxel scene). The clipmap still runs for multi-bounce + fallback.");
+                ImGui::TextWrapped("Hardware Ray Tracing repoints the screen-probe rays onto the real TLAS instead of "
+                                   "the SDF/voxel clipmap (needs RT-capable hardware; falls back to the SDF path otherwise).");
+                ImGui::TextWrapped("Firefly Clamp/Variance Weight/Luminance Clamp are the denoiser pre-filter, adaptive "
+                                   "temporal blend and post-blend clamp that sit ahead of the SH/blur/upscale chain below.");
+                ImGui::TextWrapped("Probe Update Fraction: share of probes tracing fresh rays per frame (the rest "
+                                   "reproject validated history) - the main cost dial. Surfel GI accumulates irradiance "
+                                   "on persistent world-space surfels and overrides the diffuse where covered, for "
+                                   "rock-stable indirect light near the camera.");
 
                 ImGui::Separator();
                 ImGui::TextUnformatted("Debug Views");
@@ -326,7 +351,7 @@ namespace AZ
                 bool advChanged = false;
                 advChanged |= ImGui::Checkbox("Anisotropic Voxels (no thin-wall leaks)", &config.m_anisotropic);
                 advChanged |= ImGui::Checkbox("Radiance Cache (far-field bounce)", &config.m_useRadianceCache);
-                advChanged |= ImGui::SliderFloat("Specular Roughness (cone)", &config.m_specularRoughness, 0.0f, 1.0f);
+                advChanged |= ImGui::SliderFloat("Specular Roughness Scale", &config.m_specularRoughness, 0.0f, 1.0f);
                 advChanged |= ImGui::SliderFloat("Screen Probe Blur (denoise)", &config.m_screenProbeBlur, 0.0f, 1.0f);
                 advChanged |= ImGui::SliderFloat("Cascade Blend (anti-seam)", &config.m_cascadeBlend, 0.0f, 1.0f);
                 advChanged |= ImGui::Checkbox("Volumetric GI (fog in-scatter)", &config.m_useVolumetric);

@@ -24,18 +24,23 @@ ShaderResourceGroup PassSrg : SRG_PerPass
     Texture2DMS<float4> m_albedo;
     Texture2DMS<float4> m_normal;
     Texture2DMS<float>  m_depth;
+    Texture2DMS<float4> m_specularF0;        // rgb = F0, a = roughness (Atom SpecularF0 G-buffer)
     Texture2D<float4>   m_screenProbeSH;     // 9 irradiance-SH coeffs per probe (diffuse)
     Texture2D<float4>   m_screenProbeAtlas;  // octahedral radiance (specular)
     Texture2D<float4>   m_screenProbeDepthAtlas; // octahedral depth moments for Chebyshev visibility
+    Texture2D<float4>   m_surfelData;        // world-space surfel cache (diffuse override where covered)
+    Texture2D<uint>     m_surfelGrid;        // surfel cell buckets
 
     WDGLOBALGI_SHARED_CONSTANTS
 
     uint4 m_screenProbeInfo;   // x = screenW, y = screenH, z = tilesX, w = tilesY
     float m_screenProbeSpecular;
-    float m_specularRoughness;  // glossy cone width (0 = sharp mirror, 1 = blurry)
+    float m_specularRoughness;  // global scale on the G-buffer roughness driving the glossy cone
+    uint  m_useSurfels;
 }
 
 #include <WDGlobalGICommon.azsli>
+#include <WDGlobalGISurfels.azsli>
 
 // Reconstruct the world position of a probe (tile centre) from the G-buffer depth.
 bool ProbeWorldPos(int2 tile, uint2 screenRes, out float3 worldPos)
@@ -165,23 +170,59 @@ PSOutput MainPS(VSOutput IN)
         diffuseGI = (albedo / WDGI_PI) * irradiance * PassSrg::m_giIntensity;
     }
 
-    // Glossy specular: gather the nearest probe's octahedral radiance in a roughness-driven cone around
-    // the reflection direction (5 taps: centre + a tangent-plane ring whose spread scales with
-    // m_specularRoughness). A sharp mirror collapses the ring onto the reflection ray; a rough surface
-    // widens it, blurring the reflection. Single-probe (no per-pixel roughness gbuffer) - the cone width
-    // is a global slider, which is a pragmatic step up from the previous single tap.
+    // Surfel GI: where the world-space surfel cache covers this pixel, its irradiance (accumulated at
+    // fixed world positions, so temporally rock-stable) overrides the screen-probe SH diffuse; the SH
+    // stays the fallback for sparse coverage and outside the cache window.
+    if (PassSrg::m_useSurfels != 0)
+    {
+        int3 surfelCell;
+        if (WDGI_SurfelGridCell(worldPos, surfelCell))
+        {
+            uint cellIndex = WDGI_SurfelCellIndex(surfelCell);
+            uint count = min(PassSrg::m_surfelGrid.Load(int3(WDGI_SurfelGridTexel(cellIndex, 0), 0)),
+                uint(WDGI_SURFEL_GRID_SLOTS - 1));
+            float3 surfelE = float3(0, 0, 0);
+            float surfelWSum = 0.0f;
+            [loop] for (uint s = 0; s < count; ++s)
+            {
+                uint idx = PassSrg::m_surfelGrid.Load(int3(WDGI_SurfelGridTexel(cellIndex, s + 1u), 0));
+                float4 posRadius = PassSrg::m_surfelData.Load(int3(WDGI_SurfelDataTexel(idx, 0), 0));
+                float4 surfelNormal = PassSrg::m_surfelData.Load(int3(WDGI_SurfelDataTexel(idx, 1), 0));
+                float4 irr = PassSrg::m_surfelData.Load(int3(WDGI_SurfelDataTexel(idx, 2), 0));
+                float w = WDGI_SurfelWeight(worldPos, normal, posRadius, surfelNormal.xyz);
+                w *= saturate(irr.a / 8.0f); // trust converged surfels, fade in fresh ones
+                surfelE += irr.rgb * w;
+                surfelWSum += w;
+            }
+            if (surfelWSum > 1e-3f)
+            {
+                float3 surfelDiffuse = (albedo / WDGI_PI) * (surfelE / surfelWSum) * PassSrg::m_giIntensity;
+                diffuseGI = lerp(diffuseGI, surfelDiffuse, saturate(surfelWSum));
+            }
+        }
+    }
+
+    // Glossy specular: gather the nearest probe's octahedral radiance in a cone around the reflection
+    // direction, then scale by the split-sum environment BRDF built from the SpecularF0 G-buffer
+    // (rgb = per-pixel F0, a = per-pixel roughness). Dielectrics get ~4% reflectance instead of the old
+    // unscaled radiance, which is what made the specular overblown; metals keep their tinted F0.
     float3 specularGI = float3(0, 0, 0);
     if (PassSrg::m_screenProbeSpecular > 0.0f)
     {
+        float4 specF0Roughness = PassSrg::m_specularF0.Load(coords, 0);
+        float3 specularF0 = specF0Roughness.rgb;
+        float roughness = specF0Roughness.a;
+
         int2 nearTile = clamp(int2(round(probeCoord)), int2(0, 0), maxTile);
         float3 viewDir = normalize(WDGI_ReconstructWorldPos(IN.m_texCoord, 1.0f) - worldPos);
         float3 reflDir = reflect(-viewDir, normal);
 
-        // Tangent frame around the reflection direction for the cone offsets.
+        // Tangent frame around the reflection direction; per-pixel roughness drives the cone width
+        // (m_specularRoughness is a global scale on it).
         float3 up = abs(reflDir.z) < 0.99f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
         float3 tangent = normalize(cross(up, reflDir));
         float3 bitangent = cross(reflDir, tangent);
-        float spread = saturate(PassSrg::m_specularRoughness) * 0.6f;
+        float spread = saturate(roughness * PassSrg::m_specularRoughness) * 0.6f;
 
         const float2 coneOffsets[5] =
         {
@@ -197,7 +238,14 @@ PSOutput MainPS(VSOutput IN)
         }
         reflRadiance *= 0.2f; // average of 5 taps
 
-        specularGI = reflRadiance * PassSrg::m_screenProbeSpecular;
+        // Karis mobile environment-BRDF approximation ("Physically Based Shading on Mobile"):
+        // F0 * scale + bias for the split-sum specular integral, from roughness and N.V.
+        float NoV = saturate(dot(normal, viewDir));
+        float4 r = roughness * float4(-1.0f, -0.0275f, -0.572f, 0.022f) + float4(1.0f, 0.0425f, 1.04f, -0.04f);
+        float a004 = min(r.x * r.x, exp2(-9.28f * NoV)) * r.x + r.y;
+        float2 envAB = float2(-1.04f, 1.04f) * a004 + r.zw;
+
+        specularGI = reflRadiance * (specularF0 * envAB.x + envAB.y) * PassSrg::m_screenProbeSpecular;
     }
 
     OUT.m_color = float4(diffuseGI + specularGI, 1.0f);

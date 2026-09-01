@@ -117,10 +117,66 @@
         },
         {
             "assetId": {
+                "guid": "{FB04D3DC-C14C-5BE0-BC3B-81E7AA6A2C65}"
+            },
+            "platformFlags": 255,
+            "pathHint": "passes/wdglobalgisurfelgridreset.pass"
+        },
+        {
+            "assetId": {
+                "guid": "{95601189-EB75-5644-8000-394A06E4F5ED}"
+            },
+            "platformFlags": 255,
+            "pathHint": "passes/wdglobalgisurfelgridbuild.pass"
+        },
+        {
+            "assetId": {
+                "guid": "{2FD34E87-1B2D-5ACF-9553-E10C02FCF0B9}"
+            },
+            "platformFlags": 255,
+            "pathHint": "passes/wdglobalgisurfelspawn.pass"
+        },
+        {
+            "assetId": {
+                "guid": "{3725F4FF-BC3F-59B4-A787-3C1BDA309013}"
+            },
+            "platformFlags": 255,
+            "pathHint": "passes/wdglobalgisurfelupdate.pass"
+        },
+        {
+            "assetId": {
                 "guid": "{72905974-FA02-5254-B9F3-D052E0E4C889}"
             },
             "platformFlags": 255,
             "pathHint": "shaders/wdglobalgi/wdglobalgiapply.azshader"
+        },
+        {
+            "assetId": {
+                "guid": "{67162173-8880-50F1-B9FA-870A0BB929A3}"
+            },
+            "platformFlags": 255,
+            "pathHint": "shaders/wdglobalgi/wdglobalgisurfelgridreset.azshader"
+        },
+        {
+            "assetId": {
+                "guid": "{036D1A35-F3FC-5099-B8CF-4A45704258E7}"
+            },
+            "platformFlags": 255,
+            "pathHint": "shaders/wdglobalgi/wdglobalgisurfelgridbuild.azshader"
+        },
+        {
+            "assetId": {
+                "guid": "{728C7B27-DA22-59D4-9FB0-5F7CB9AF3DF5}"
+            },
+            "platformFlags": 255,
+            "pathHint": "shaders/wdglobalgi/wdglobalgisurfelspawn.azshader"
+        },
+        {
+            "assetId": {
+                "guid": "{FB295AF5-2DAD-548B-AB27-C58E63F95D72}"
+            },
+            "platformFlags": 255,
+            "pathHint": "shaders/wdglobalgi/wdglobalgisurfelupdate.azshader"
         },
         {
             "assetId": {

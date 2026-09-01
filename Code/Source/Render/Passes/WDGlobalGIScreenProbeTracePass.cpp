@@ -35,7 +35,9 @@ namespace AZ
                 return false;
             }
             WDGlobalGIFeatureProcessor* fp = GetFeatureProcessor();
-            return fp && fp->GetUseScreenProbes();
+            // Mutually exclusive with WDGlobalGIScreenProbeTraceRTPass, which writes the same atlas via
+            // the TLAS instead of the SDF when hardware RT is selected (Phase 9).
+            return fp && fp->GetUseScreenProbes() && !fp->GetUseHardwareRT();
         }
 
         void WDGlobalGIScreenProbeTracePass::SetupGIFrameGraph(RHI::FrameGraphInterface frameGraph)
@@ -142,6 +144,24 @@ namespace AZ
             if (RHI::ShaderInputConstantIndex tIndex = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeTemporal")); tIndex.IsValid())
             {
                 srg->SetConstantRaw(tIndex, &temporal, sizeof(temporal));
+            }
+
+            const WDGlobalGIConfiguration& config = fp->GetConfiguration();
+            if (RHI::ShaderInputConstantIndex idx = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeFireflyClamp")); idx.IsValid())
+            {
+                srg->SetConstantRaw(idx, &config.m_screenProbeFireflyClamp, sizeof(config.m_screenProbeFireflyClamp));
+            }
+            if (RHI::ShaderInputConstantIndex idx = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeVarianceScale")); idx.IsValid())
+            {
+                srg->SetConstantRaw(idx, &config.m_screenProbeVarianceScale, sizeof(config.m_screenProbeVarianceScale));
+            }
+            if (RHI::ShaderInputConstantIndex idx = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeLuminanceClamp")); idx.IsValid())
+            {
+                srg->SetConstant(idx, config.m_screenProbeLuminanceClamp);
+            }
+            if (RHI::ShaderInputConstantIndex idx = layout->FindShaderInputConstantIndex(AZ::Name("m_screenProbeMaxLuminance")); idx.IsValid())
+            {
+                srg->SetConstantRaw(idx, &config.m_screenProbeMaxLuminance, sizeof(config.m_screenProbeMaxLuminance));
             }
         }
 

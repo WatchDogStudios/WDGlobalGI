@@ -17,7 +17,7 @@ namespace AZ
         //! Scene feedback loop (Dagor GI "scene feedback").
         //! Relights G-buffer pixels with direct light + the current irradiance clipmap and writes the
         //! result into the voxel-radiance clipmap with a moving average. This both provides multiple
-        //! light bounces and fixes voxelization issues (thin walls), exactly as described in the talk.
+        //! light bounces and fixes voxelization issues (thin walls), and solves what we see in WDC-NF-23112!
         class WDGlobalGISceneInjectPass final
             : public WDGlobalGIComputePass
         {

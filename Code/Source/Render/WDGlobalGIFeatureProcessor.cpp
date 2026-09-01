@@ -15,6 +15,7 @@
 #include <AzCore/Serialization/EditContext.h>
 #include <AzCore/Serialization/EditContextConstants.inl>
 
+#include <Atom/RHI/RHISystemInterface.h>
 #include <Atom/RPI.Public/RenderPipeline.h>
 #include <Atom/RPI.Public/RPIUtils.h>
 #include <Atom/RPI.Public/Pass/PassFilter.h>
@@ -43,6 +44,7 @@ namespace AZ
                     ->Field("MaxRaySteps", &WDGlobalGIConfiguration::m_maxRaySteps)
                     ->Field("ProbeUpdateFraction", &WDGlobalGIConfiguration::m_probeUpdateFraction)
                     ->Field("UseScreenProbes", &WDGlobalGIConfiguration::m_useScreenProbes)
+                    ->Field("UseHardwareRT", &WDGlobalGIConfiguration::m_useHardwareRT)
                     ->Field("ScreenProbeTemporal", &WDGlobalGIConfiguration::m_screenProbeTemporal)
                     ->Field("ScreenProbeSpecular", &WDGlobalGIConfiguration::m_screenProbeSpecular)
                     ->Field("LeakReduction", &WDGlobalGIConfiguration::m_leakReduction)
@@ -57,7 +59,12 @@ namespace AZ
                     ->Field("UseRadianceCache", &WDGlobalGIConfiguration::m_useRadianceCache)
                     ->Field("SpecularRoughness", &WDGlobalGIConfiguration::m_specularRoughness)
                     ->Field("ScreenProbeBlur", &WDGlobalGIConfiguration::m_screenProbeBlur)
+                    ->Field("ScreenProbeFireflyClamp", &WDGlobalGIConfiguration::m_screenProbeFireflyClamp)
+                    ->Field("ScreenProbeVarianceScale", &WDGlobalGIConfiguration::m_screenProbeVarianceScale)
+                    ->Field("ScreenProbeLuminanceClamp", &WDGlobalGIConfiguration::m_screenProbeLuminanceClamp)
+                    ->Field("ScreenProbeMaxLuminance", &WDGlobalGIConfiguration::m_screenProbeMaxLuminance)
                     ->Field("CascadeBlend", &WDGlobalGIConfiguration::m_cascadeBlend)
+                    ->Field("UseSurfels", &WDGlobalGIConfiguration::m_useSurfels)
                     ->Field("UseVolumetric", &WDGlobalGIConfiguration::m_useVolumetric)
                     ->Field("VolumetricDensity", &WDGlobalGIConfiguration::m_volumetricDensity)
                     ->Field("VolumetricIntensity", &WDGlobalGIConfiguration::m_volumetricIntensity)
@@ -86,14 +93,15 @@ namespace AZ
                             ->Attribute(AZ::Edit::Attributes::Max, 0.999f)
                         ->DataElement(AZ::Edit::UIHandlers::Default, &WDGlobalGIConfiguration::m_raysPerProbe, "Rays Per Probe", "Base ray budget per probe update")
                         ->DataElement(AZ::Edit::UIHandlers::Default, &WDGlobalGIConfiguration::m_maxRaySteps, "Max Ray Steps", "Voxel ray-march step budget")
-                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_probeUpdateFraction, "Probe Update Fraction", "Fraction of probes refreshed per frame")
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_probeUpdateFraction, "Probe Update Fraction", "Fraction of screen probes tracing fresh rays per frame (the rest reproject history). Lower = cheaper, slower GI response.")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
                         ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useScreenProbes, "Use Screen Probes", "Per-pixel octahedral screen-space probes (sharper, Lumen/daGI2-style) instead of the coarse 6-value ambient-cube clipmap composite. The single biggest quality jump - recommended.")
+                        ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useHardwareRT, "Use Hardware Ray Tracing", "Trace the screen probes against the real ray-tracing TLAS instead of the SDF/voxel clipmap (needs Use Screen Probes on and hardware RT support; falls back to the SDF path otherwise).")
                         ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeTemporal, "Screen Probe Temporal", "Temporal accumulation for the screen probes (higher = smoother but slower to respond).")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 0.98f)
-                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeSpecular, "Screen Probe Specular", "Glossy reflection strength from the screen probes (0 = diffuse only).")
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeSpecular, "Screen Probe Specular", "Glossy reflection strength from the screen probes, scaled by the material's F0/roughness (0 = diffuse only, 1 = physically based).")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
                         ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useRelight, "Relight Voxels", "Relight the whole voxel scene from albedo + sun each frame (dynamic time-of-day, with SDF voxel shadows). Off = real-lighting injection of visible voxels only.")
@@ -105,15 +113,26 @@ namespace AZ
                         ->DataElement(AZ::Edit::UIHandlers::Default, &WDGlobalGIConfiguration::m_skyIntensity, "Sky Intensity", "Ambient sky intensity")
                         ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_anisotropic, "Anisotropic Voxels", "Store/sample 6-direction radiance so thin walls don't leak light (~25 MB extra).")
                         ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useRadianceCache, "Radiance Cache", "Escaped/long GI rays reuse the cached world irradiance as far-field light (extra bounce).")
-                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_specularRoughness, "Specular Roughness", "Glossy reflection cone width (0 = sharp mirror, 1 = blurry). Screen probes only.")
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_specularRoughness, "Specular Roughness Scale", "Scale on the material's G-buffer roughness driving the glossy cone width (0 = force sharp mirrors, 1 = trust the material). Screen probes only.")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
                         ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeBlur, "Screen Probe Blur", "Depth-aware spatial denoise of the screen-probe GI (0 = off, 1 = full). The main noise fix.")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeFireflyClamp, "Screen Probe Firefly Clamp", "Per-probe pre-filter: clamp octahedral samples brighter than this multiple of the probe's own mean, before the temporal blend (0 = off).")
+                            ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                            ->Attribute(AZ::Edit::Attributes::Max, 16.0f)
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeVarianceScale, "Screen Probe Variance Weight", "Scales how strongly per-texel temporal variance reduces the temporal weight (converged probes stay near full history, noisy ones accumulate faster). 0 = off (constant weight).")
+                            ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                            ->Attribute(AZ::Edit::Attributes::Max, 64.0f)
+                        ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_screenProbeLuminanceClamp, "Screen Probe Luminance Clamp", "Clamp the post-blend screen-probe radiance to Screen Probe Max Luminance (same scheme as the SSR luminance clamp).")
+                        ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_screenProbeMaxLuminance, "Screen Probe Max Luminance", "Luminance ceiling used by Screen Probe Luminance Clamp.")
+                            ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                            ->Attribute(AZ::Edit::Attributes::Max, 64.0f)
                         ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_cascadeBlend, "Cascade Blend", "Blend voxel radiance across clipmap cascade boundaries to hide cascade-line seams (0 = hard, 1 = full).")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
                             ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+                        ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useSurfels, "Surfel GI", "World-space surfel cache: irradiance accumulates at fixed world positions and overrides the screen-probe diffuse where covered (temporally stable). Needs Use Screen Probes.")
                         ->DataElement(AZ::Edit::UIHandlers::CheckBox, &WDGlobalGIConfiguration::m_useVolumetric, "Volumetric GI", "In-scatter indirect light into a view-aligned fog volume (additive).")
                         ->DataElement(AZ::Edit::UIHandlers::Slider, &WDGlobalGIConfiguration::m_volumetricDensity, "Volumetric Density", "Fog thickness.")
                             ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
@@ -265,6 +284,16 @@ namespace AZ
             m_configuration = config;
             m_configuration.m_cascadeCount =
                 AZ::GetClamp<uint32_t>(m_configuration.m_cascadeCount, 1u, WDGlobalGILimits::MaxCascades);
+
+            // Fall back to the SDF path instead of letting the screen-probe atlas silently go dark: the
+            // hardware-RT trace pass no-ops on a device with no ray tracing support (RayTracingPass ctor),
+            // but the SDF trace pass also skips itself whenever hardware RT is selected (mutual exclusion),
+            // so without this clamp neither pass would run.
+            if (m_configuration.m_useHardwareRT &&
+                RHI::RHISystemInterface::Get()->GetRayTracingSupport() == RHI::MultiDevice::NoDevices)
+            {
+                m_configuration.m_useHardwareRT = false;
+            }
 
             if (geometryChanged)
             {
