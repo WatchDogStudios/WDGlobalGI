@@ -8,6 +8,7 @@
 
 #include <Render/WDGlobalGIFeatureProcessor.h>
 
+#include <AzCore/Asset/AssetManagerBus.h>
 #include <AzCore/Math/Matrix4x4.h>
 #include <AzCore/Math/Aabb.h>
 #include <AzCore/Math/Color.h>
@@ -22,6 +23,7 @@
 #include <Atom/RPI.Public/Pass/PassSystemInterface.h>
 #include <Atom/RPI.Public/View.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomFeatureProcessorInterface.h>
+#include <Atom/RPI.Reflect/Shader/ShaderAsset.h>
 #include <Atom/RPI.Public/AuxGeom/AuxGeomDraw.h>
 
 namespace AZ
@@ -288,11 +290,21 @@ namespace AZ
             // Fall back to the SDF path instead of letting the screen-probe atlas silently go dark: the
             // hardware-RT trace pass no-ops on a device with no ray tracing support (RayTracingPass ctor),
             // but the SDF trace pass also skips itself whenever hardware RT is selected (mutual exclusion),
-            // so without this clamp neither pass would run.
-            if (m_configuration.m_useHardwareRT &&
-                RHI::RHISystemInterface::Get()->GetRayTracingSupport() == RHI::MultiDevice::NoDevices)
+            // so without this clamp neither pass would run. The same applies when the RT shader products
+            // never built on this platform (WDGlobalGI#2) - the RT pass refuses to create then (see
+            // WDGlobalGIScreenProbeTraceRTPass::Create), so RT must not stay selected.
+            if (m_configuration.m_useHardwareRT)
             {
-                m_configuration.m_useHardwareRT = false;
+                bool rtAvailable = RHI::RHISystemInterface::Get()->GetRayTracingSupport() != RHI::MultiDevice::NoDevices;
+                if (rtAvailable)
+                {
+                    Data::AssetId rayGenAssetId;
+                    Data::AssetCatalogRequestBus::BroadcastResult(rayGenAssetId,
+                        &Data::AssetCatalogRequestBus::Events::GetAssetIdByPath,
+                        "Shaders/WDGlobalGI/WDGlobalGIScreenProbeTraceRT.shader", azrtti_typeid<RPI::ShaderAsset>(), false);
+                    rtAvailable = rayGenAssetId.IsValid();
+                }
+                m_configuration.m_useHardwareRT = rtAvailable;
             }
 
             if (geometryChanged)

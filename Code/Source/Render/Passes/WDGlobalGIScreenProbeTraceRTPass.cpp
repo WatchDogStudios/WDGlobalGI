@@ -9,13 +9,18 @@
 #include <Render/Passes/WDGlobalGIScreenProbeTraceRTPass.h>
 #include <Render/WDGlobalGIFeatureProcessor.h>
 
+#include <AzCore/Asset/AssetManagerBus.h>
 #include <AzCore/Math/MathUtils.h>
+#include <Atom/Feature/RayTracing/RayTracingPassData.h>
 #include <Atom/RHI/DispatchRaysItem.h>
 #include <Atom/RHI/FrameGraphAttachmentInterface.h>
 #include <Atom/RHI/FrameGraphCompileContext.h>
 #include <Atom/RHI/FrameGraphInterface.h>
+#include <Atom/RHI/RHISystemInterface.h>
 #include <Atom/RPI.Public/RenderPipeline.h>
 #include <Atom/RPI.Public/Scene.h>
+#include <Atom/RPI.Public/Pass/PassUtils.h>
+#include <Atom/RPI.Reflect/Shader/ShaderAsset.h>
 
 namespace AZ
 {
@@ -23,6 +28,42 @@ namespace AZ
     {
         RPI::Ptr<WDGlobalGIScreenProbeTraceRTPass> WDGlobalGIScreenProbeTraceRTPass::Create(const RPI::PassDescriptor& descriptor)
         {
+            // RayTracingPass's constructor asserts, then null-derefs, when any of the three RT shader
+            // products is absent from the asset catalog - e.g. the Asset Processor failed to build them
+            // on this platform (WDGlobalGI#2, Linux). This pass is instantiated from the parent template
+            // unconditionally, so that must degrade to "no RT pass" - the parent skips a null child and
+            // the SDF screen-probe trace stays the active path - not break every pass-tree build.
+            // (A device with no ray tracing support at all is already safe: the base constructor
+            // early-outs before touching the shaders.)
+            if (RHI::RHISystemInterface::Get()->GetRayTracingSupport() != RHI::MultiDevice::NoDevices)
+            {
+                const RayTracingPassData* passData = RPI::PassUtils::GetPassData<RayTracingPassData>(descriptor);
+                auto shaderMissing = [](const RPI::AssetReference& reference)
+                {
+                    Data::AssetId assetId = reference.m_assetId;
+                    if (!assetId.IsValid())
+                    {
+                        Data::AssetCatalogRequestBus::BroadcastResult(assetId,
+                            &Data::AssetCatalogRequestBus::Events::GetAssetIdByPath,
+                            reference.m_filePath.c_str(), azrtti_typeid<RPI::ShaderAsset>(), false);
+                    }
+                    Data::AssetInfo assetInfo;
+                    Data::AssetCatalogRequestBus::BroadcastResult(assetInfo,
+                        &Data::AssetCatalogRequestBus::Events::GetAssetInfoById, assetId);
+                    return !assetInfo.m_assetId.IsValid();
+                };
+                if (!passData ||
+                    shaderMissing(passData->m_rayGenerationShaderAssetReference) ||
+                    shaderMissing(passData->m_closestHitShaderAssetReference) ||
+                    shaderMissing(passData->m_missShaderAssetReference))
+                {
+                    AZ_Warning("WDGlobalGIScreenProbeTraceRTPass", false,
+                        "Hardware-RT screen-probe shaders are not available (did they fail to build for "
+                        "this platform?). Skipping the RT trace pass; the SDF screen-probe trace remains "
+                        "the active path.");
+                    return nullptr;
+                }
+            }
             return aznew WDGlobalGIScreenProbeTraceRTPass(descriptor);
         }
 
