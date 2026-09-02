@@ -43,15 +43,13 @@ void ClosestHit(inout WDGiRtPayload payload, BuiltInTriangleIntersectionAttribut
     VsInput vertex = GetHitInterpolatedVertexData(meshInfo, PrimitiveIndex(), attrib.barycentrics);
     float3 positionWS = mul(ObjectToWorld3x4(), float4(vertex.position, 1.0f));
 
-    // Widen the ray cone the raygen seeded, turn its footprint at the hit into a texture mip - same
-    // pattern as ReflectionScreenSpaceRayTracingClosestHit.azsl.
-    float3 geometricNormalWS;
-    float triangleLodConstant = GetHitTriangleLodConstant(meshInfo, PrimitiveIndex(), geometricNormalWS);
-    RayCone hitCone = PropagateRayCone(UnpackRayCone(payload.m_packedRayCone), RayTCurrent());
-    float mipLevel = ComputeRayConeTextureLod(
-        hitCone, triangleLodConstant, WorldRayDirection(), geometricNormalWS,
-        GetFallbackPBRMaterialBaseColorDimensions(materialInfo));
-    TextureData textureData = GetFallbackPBRMaterialTextureData(materialInfo, RayTracingSceneSrg::LinearSampler, vertex.uv0, mipLevel);
+    // Fixed mip 4 for the material sample, not a ray-cone-derived LOD: this radiance feeds an 8x8
+    // octahedral probe -> firefly clamp -> temporal blend -> SH projection -> spatial blur, so per-hit
+    // mip accuracy is invisible - and the ray-cone machinery lived in NightFox-only ShaderLib files
+    // (RayCones.azsli) that broke the gem's shader build on other engines (WDGlobalGI#2). A few mips
+    // down is the cheap stand-in for the footprint a probe texel actually covers; SampleLevel clamps
+    // to the texture's own mip count.
+    TextureData textureData = GetFallbackPBRMaterialTextureData(materialInfo, RayTracingSceneSrg::LinearSampler, vertex.uv0, 4.0f);
 
     // ponytail: interpolated vertex normal only, no normal-map sample (unlike the specular ClosestHit
     // this mirrors) - a diffuse GI probe doesn't need per-texel normal detail. Upgrade path: sample

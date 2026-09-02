@@ -24,7 +24,7 @@
                 "ClosestHitShaderName": "ClosestHit",
                 "MissShaderAsset": { "FilePath": "Shaders/WDGlobalGI/WDGlobalGIScreenProbeTraceRTMiss.shader" },
                 "MissShaderName": "Miss",
-                "MaxPayloadSize": 32,
+                "MaxPayloadSize": 16,
                 "MaxRecursionDepth": 2,
                 "MaxRayLength": 500.0
             }

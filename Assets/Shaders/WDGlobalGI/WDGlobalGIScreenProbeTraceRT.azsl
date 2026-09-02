@@ -55,12 +55,12 @@ void RayGeneration()
         return;
     }
 
-    // Cranley-Patterson jitter of the octa sub-texel direction (Sampling.azsli), decorrelated per
-    // atlas texel and frame. A fixed 8x8 octahedral direction set never improves; jittering it and
-    // leaning on the existing temporal blend below turns this into a slowly-converging estimate
-    // instead, at zero extra ray cost.
-    uint seed = GetRandomSeed(atlasCoord, PassSrg::m_frameIndex, 0);
-    float2 jitter = (GetRandomFloat2(seed) - float2(0.5f, 0.5f)) / float(WDGI_SP_OCTA);
+    // Sub-texel jitter of the octa direction, decorrelated per atlas texel and frame (the gem's own
+    // WDGI_Hash RNG - no engine Sampling.azsli dependency). A fixed 8x8 octahedral direction set never
+    // improves; jittering it and leaning on the existing temporal blend below turns this into a
+    // slowly-converging estimate instead, at zero extra ray cost.
+    uint seed = WDGI_Hash(atlasCoord.x ^ (atlasCoord.y << 16u) ^ WDGI_Hash(PassSrg::m_frameIndex));
+    float2 jitter = (float2(WDGI_RandFromUint(seed), WDGI_RandFromUint(seed ^ 0x9E3779B9u)) - float2(0.5f, 0.5f)) / float(WDGI_SP_OCTA);
     float3 dir = WDGI_OctaDecode(saturate((float2(octa) + 0.5f) / float(WDGI_SP_OCTA) + jitter));
 
     RayDesc ray;
@@ -69,15 +69,7 @@ void RayGeneration()
     ray.TMin = 0.0f;
     ray.TMax = RayTracingGlobalSrg::m_maxRayLength;
 
-    // Ray cone seeded from the actual screen footprint one probe tile represents (RayCones.azsli),
-    // not DispatchRaysDimensions() - this dispatch runs over the octahedral atlas, not the screen, so
-    // GetCameraPixelSpreadAngle()'s own DispatchRaysDimensions().y read would size the cone from the
-    // wrong resolution.
-    float tanHalfFovY = 1.0f / max(abs(ViewSrg::m_projectionMatrix[1][1]), 1e-6f);
-    RayCone cone = MakeRayCone(0.0f, GetPixelSpreadAngle(tanHalfFovY, screenRes.y));
-
     WDGiRtPayload payload = (WDGiRtPayload)0;
-    payload.m_packedRayCone = PackRayCone(cone);
     TraceRay(RayTracingSceneSrg::m_scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
 
     float3 radiance = payload.m_radiance;

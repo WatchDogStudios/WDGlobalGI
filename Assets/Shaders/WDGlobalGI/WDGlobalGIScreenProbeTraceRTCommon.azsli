@@ -7,7 +7,7 @@
  * Shared payload + SRG for the Phase 9 hardware-RT screen-probe trace pipeline
  * (WDGlobalGIScreenProbeTraceRT / ...ClosestHit / ...Miss). Included identically by all three stages -
  * see the comment in Atom's PathTracingCommon.azsli for why every ray tracing pipeline in this tree does
- * that (SRG_RayTracingGlobal / RayCones.azsli have a fixed FrequencyId and layout owned by Reflections;
+ * that (SRG_RayTracingGlobal has a fixed FrequencyId and layout owned by Reflections;
  * SRG_PerPass is free, so our own resources - the octahedral atlas, its history, and the shared GI
  * constants - go there instead, same as this file's non-RT sibling, WDGlobalGICommon.azsli).
  *
@@ -25,9 +25,11 @@
 
 // Forces RayTracingGlobalSrg (SRG_RayTracingGlobal) + RayTracingSceneSrg (SRG_RayTracingScene) + ViewSrg +
 // SceneSrg + Bindless into scope - required by every stage of a ray tracing pipeline in this tree, even
-// though this pass never reads RayTracingGlobalSrg's own (Reflections-owned) fields.
-#include <Atom/Features/RayTracing/RayCones.azsli>
-#include <Atom/Features/RayTracing/Sampling.azsli>
+// though this pass never reads RayTracingGlobalSrg's own (Reflections-owned) fields. Only includes that
+// exist in stock upstream O3DE, deliberately: this gem also ships standalone, and depending on
+// NightFox-only ShaderLib files (RayCones.azsli, Sampling.azsli) broke the shader build on other engines
+// (WDGlobalGI#2) - the gem's own WDGI_Hash RNG covers the jitter, and hit shading samples a fixed mip.
+#include <Atom/Features/RayTracing/RayTracingSrgs.azsli>
 #include <Atom/Features/RayTracing/RayTracingSceneUtils.azsli> // VsInput, GetMeshInfoEntry, GetHitInterpolatedVertexData
 
 ShaderResourceGroup PassSrg : SRG_PerPass
@@ -60,13 +62,12 @@ ShaderResourceGroup PassSrg : SRG_PerPass
 #define WDGI_SP_TRACE
 #include <WDGlobalGICommon.azsli>
 
-//! Carries the hit radiance (or sky, on a miss) back to the raygen, plus enough state for the shadow
-//! visibility sub-trace and the ray-cone texture LOD. m_hitT < 0 means "miss" (set by the Miss shader);
-//! the shadow-visibility trace relies on the zero-initialised default surviving a RAY_FLAG_SKIP_CLOSEST_
-//! HIT_SHADER hit, exactly like Reflections' CheckLightVisibility() in ReflectionScreenSpaceRayTracingCommon.azsli.
+//! Carries the hit radiance (or sky, on a miss) back to the raygen. m_hitT < 0 means "miss" (set by the
+//! Miss shader); the shadow-visibility trace relies on the zero-initialised default surviving a
+//! RAY_FLAG_SKIP_CLOSEST_HIT_SHADER hit, exactly like Reflections' CheckLightVisibility() in
+//! ReflectionScreenSpaceRayTracingCommon.azsli.
 struct WDGiRtPayload
 {
     float3 m_radiance;
     float  m_hitT;
-    uint   m_packedRayCone;
 };
