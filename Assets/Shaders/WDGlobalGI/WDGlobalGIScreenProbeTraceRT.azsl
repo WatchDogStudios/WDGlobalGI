@@ -64,7 +64,13 @@ void RayGeneration()
     float3 dir = WDGI_OctaDecode(saturate((float2(octa) + 0.5f) / float(WDGI_SP_OCTA) + jitter));
 
     RayDesc ray;
-    ray.Origin = worldPos + dir * 0.02f;
+    // Depth-reconstructed positions jitter along the view ray by more than a fixed epsilon (and grow with
+    // distance), so on some probes the origin lands behind the surface: every upper-hemisphere ray then
+    // hits that surface's backface at ~0 and the probe reads as fully occluded, dropping whole patches of
+    // complex meshes as the camera moves. Lift the origin toward the camera, scaled with view distance.
+    float3 toCamera = WDGI_ReconstructWorldPos(uv, 1.0f) - worldPos;
+    float cameraDist = length(toCamera);
+    ray.Origin = worldPos + (toCamera / max(cameraDist, 1e-4f)) * (0.02f + 0.004f * cameraDist);
     ray.Direction = dir;
     ray.TMin = 0.0f;
     ray.TMax = RayTracingGlobalSrg::m_maxRayLength;
